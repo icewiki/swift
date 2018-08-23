@@ -9,7 +9,7 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-// RUN: %target-run-stdlib-swift
+// RUN: %target-run-stdlib-swift-swift3
 // REQUIRES: executable_test
 
 // FIXME: This test runs very slowly on watchOS.
@@ -60,11 +60,11 @@ internal func _splitRandomAccessIndexRange<
 ) -> [Range<C.Index>] {
   let startIndex = range.lowerBound
   let endIndex = range.upperBound
-  let length = elements.distance(from: startIndex, to: endIndex).toIntMax()
+  let length = elements.distance(from: startIndex, to: endIndex)
   if length < 2 {
     return [range]
   }
-  let middle = elements.index(startIndex, offsetBy: C.IndexDistance(length / 2))
+  let middle = elements.index(startIndex, offsetBy: length / 2)
   return [startIndex ..< middle, middle ..< endIndex]
 }
 
@@ -231,8 +231,8 @@ struct _ForkJoinMutex {
     if pthread_mutex_destroy(_mutex) != 0 {
       fatalError("pthread_mutex_init")
     }
-    _mutex.deinitialize()
-    _mutex.deallocate(capacity: 1)
+    _mutex.deinitialize(count: 1)
+    _mutex.deallocate()
   }
 
   func withLock<Result>(_ body: () -> Result) -> Result {
@@ -261,8 +261,8 @@ struct _ForkJoinCond {
     if pthread_cond_destroy(_cond) != 0 {
       fatalError("pthread_cond_destroy")
     }
-    _cond.deinitialize()
-    _cond.deallocate(capacity: 1)
+    _cond.deinitialize(count: 1)
+    _cond.deallocate()
   }
 
   func signal() {
@@ -680,7 +680,7 @@ final public class ForkJoinPool {
       _runningThreadsMutex.withLock {
         _submissionQueuesMutex.withLock {
           _workDequesMutex.withLock {
-            let i = _runningThreads.index { $0 === thread }!
+            let i = _runningThreads.firstIndex { $0 === thread }!
             ForkJoinPool._threadRegistry[thread._tid!] = nil
             _runningThreads.remove(at: i)
             _submissionQueues.remove(at: i)
@@ -729,7 +729,7 @@ final public class ForkJoinPool {
 
   internal func _stealTask() -> ForkJoinTaskBase? {
     return _workDequesMutex.withLock {
-      let randomOffset = pickRandom(_workDeques.indices)
+      let randomOffset = _workDeques.indices.randomElement()!
       let count = _workDeques.count
       for i in _workDeques.indices {
         let index = (i + randomOffset) % count
@@ -767,7 +767,7 @@ final public class ForkJoinPool {
     _submissionQueuesMutex.withLock {
       precondition(!_submissionQueues.isEmpty)
       for task in tasks {
-        pickRandom(_submissionQueues).append(task)
+        _submissionQueues.randomElement()!.append(task)
       }
     }
   }
@@ -784,7 +784,7 @@ final public class ForkJoinPool {
       let done = _submissionQueuesMutex.withLock {
         () -> Bool in
         if !_submissionQueues.isEmpty {
-          pickRandom(_submissionQueues).append(task)
+          _submissionQueues.randomElement()!.append(task)
           return true
         }
         return false
@@ -1448,4 +1448,3 @@ http://habrahabr.ru/post/255659/
 */
 
 runAllTests()
-

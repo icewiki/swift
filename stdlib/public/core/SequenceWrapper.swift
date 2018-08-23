@@ -19,7 +19,7 @@
 @_show_in_interface
 public // @testable
 protocol _SequenceWrapper : Sequence {
-  associatedtype Base : Sequence
+  associatedtype Base : Sequence where Base.Element == Element
   associatedtype Iterator = Base.Iterator
   associatedtype SubSequence = Base.SubSequence
   
@@ -27,10 +27,12 @@ protocol _SequenceWrapper : Sequence {
 }
 
 extension _SequenceWrapper  {
+  @inlinable // FIXME(sil-serialize-all)
   public var underestimatedCount: Int {
     return _base.underestimatedCount
   }
 
+  @inlinable // FIXME(sil-serialize-all)
   public func _preprocessingPass<R>(
     _ preprocess: () throws -> R
   ) rethrows -> R? {
@@ -39,84 +41,90 @@ extension _SequenceWrapper  {
 }
 
 extension _SequenceWrapper where Iterator == Base.Iterator {
+  @inlinable // FIXME(sil-serialize-all)
   public func makeIterator() -> Iterator {
     return self._base.makeIterator()
   }
   
+  @inlinable // FIXME(sil-serialize-all)
   @discardableResult
   public func _copyContents(
-    initializing buf: UnsafeMutableBufferPointer<Iterator.Element>
-  ) -> (Iterator, UnsafeMutableBufferPointer<Iterator.Element>.Index) {
+    initializing buf: UnsafeMutableBufferPointer<Element>
+  ) -> (Iterator, UnsafeMutableBufferPointer<Element>.Index) {
     return _base._copyContents(initializing: buf)
   }
 }
 
-extension _SequenceWrapper where Iterator.Element == Base.Iterator.Element {
+extension _SequenceWrapper {
+  @inlinable // FIXME(sil-serialize-all)
   public func map<T>(
-    _ transform: (Iterator.Element) throws -> T
+    _ transform: (Element) throws -> T
 ) rethrows -> [T] {
     return try _base.map(transform)
   }
   
+  @inlinable // FIXME(sil-serialize-all)
   public func filter(
-    _ isIncluded: (Iterator.Element) throws -> Bool
-  ) rethrows -> [Iterator.Element] {
+    _ isIncluded: (Element) throws -> Bool
+  ) rethrows -> [Element] {
     return try _base.filter(isIncluded)
   }
 
-  public func forEach(_ body: (Iterator.Element) throws -> Void) rethrows {
+  @inlinable // FIXME(sil-serialize-all)
+  public func forEach(_ body: (Element) throws -> Void) rethrows {
     return try _base.forEach(body)
   }
   
+  @inlinable // FIXME(sil-serialize-all)
   public func _customContainsEquatableElement(
-    _ element: Iterator.Element
+    _ element: Element
   ) -> Bool? { 
     return _base._customContainsEquatableElement(element)
   }
   
+  @inlinable // FIXME(sil-serialize-all)
   public func _copyToContiguousArray()
-    -> ContiguousArray<Iterator.Element> {
+    -> ContiguousArray<Element> {
     return _base._copyToContiguousArray()
   }
 }
 
 extension _SequenceWrapper where SubSequence == Base.SubSequence {
+  @inlinable // FIXME(sil-serialize-all)
   public func dropFirst(_ n: Int) -> SubSequence {
     return _base.dropFirst(n)
   }
+  @inlinable // FIXME(sil-serialize-all)
   public func dropLast(_ n: Int) -> SubSequence {
     return _base.dropLast(n)
   }
+  @inlinable // FIXME(sil-serialize-all)
   public func prefix(_ maxLength: Int) -> SubSequence {
     return _base.prefix(maxLength)
   }
+  @inlinable // FIXME(sil-serialize-all)
   public func suffix(_ maxLength: Int) -> SubSequence {
     return _base.suffix(maxLength)
   }
-}
 
-extension _SequenceWrapper
-  where SubSequence == Base.SubSequence, Iterator.Element == Base.Iterator.Element {
-
+  @inlinable // FIXME(sil-serialize-all)
   public func drop(
-    while predicate: (Iterator.Element) throws -> Bool
+    while predicate: (Element) throws -> Bool
   ) rethrows -> SubSequence {
     return try _base.drop(while: predicate)
   }
 
+  @inlinable // FIXME(sil-serialize-all)
   public func prefix(
-    while predicate: (Iterator.Element) throws -> Bool
+    while predicate: (Element) throws -> Bool
   ) rethrows -> SubSequence {
     return try _base.prefix(while: predicate)
   }
   
-  public func suffix(_ maxLength: Int) -> SubSequence {
-    return _base.suffix(maxLength)
-  }
-
+  @inlinable // FIXME(sil-serialize-all)
   public func split(
     maxSplits: Int, omittingEmptySubsequences: Bool,
-    whereSeparator isSeparator: (Iterator.Element) throws -> Bool
+    whereSeparator isSeparator: (Element) throws -> Bool
   ) rethrows -> [SubSequence] {
     return try _base.split(
       maxSplits: maxSplits,

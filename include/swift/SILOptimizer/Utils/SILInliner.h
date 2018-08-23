@@ -20,6 +20,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "swift/SIL/TypeSubstCloner.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include <functional>
 
 namespace swift {
@@ -35,25 +36,53 @@ enum class InlineCost : unsigned {
 /// disappear at the LLVM IR level are assigned a cost of 'Free'.
 InlineCost instructionInlineCost(SILInstruction &I);
 
-class SILInliner : public TypeSubstCloner<SILInliner> {
-public:
-  friend class SILVisitor<SILInliner>;
+class SILInliner : public TypeSubstCloner<SILInliner, SILOptFunctionBuilder> {
+  friend class SILInstructionVisitor<SILInliner>;
   friend class SILCloner<SILInliner>;
-  
-  enum class InlineKind {
-    MandatoryInline,
-    PerformanceInline
-  };
+  using SuperTy = TypeSubstCloner<SILInliner, SILOptFunctionBuilder>;
 
-  SILInliner(SILFunction &To, SILFunction &From, InlineKind IKind,
-             SubstitutionList ApplySubs,
+public:
+  enum class InlineKind { MandatoryInline, PerformanceInline };
+
+  // Returns true if this an apply site that can't be inlined for some
+  // structural reason.
+  static bool canInline(FullApplySite AI);
+
+private:
+  InlineKind IKind;
+
+  SILBasicBlock *CalleeEntryBB = nullptr;
+
+  /// \brief The location representing the inlined instructions.
+  ///
+  /// This location wraps the call site AST node that is being inlined.
+  /// Alternatively, it can be the SIL file location of the call site (in case
+  /// of SIL-to-SIL transformations).
+  Optional<SILLocation> Loc;
+  const SILDebugScope *CallSiteScope = nullptr;
+  SILFunction *CalleeFunction = nullptr;
+  llvm::SmallDenseMap<const SILDebugScope *, const SILDebugScope *, 8>
+      InlinedScopeCache;
+  CloneCollector::CallbackType Callback;
+  SILOptFunctionBuilder &FuncBuilder;
+
+public:
+  SILInliner(SILOptFunctionBuilder &FuncBuilder,
+	     SILFunction &To, SILFunction &From, InlineKind IKind,
+             SubstitutionMap ApplySubs,
              SILOpenedArchetypesTracker &OpenedArchetypesTracker,
              CloneCollector::CallbackType Callback = nullptr)
-      : TypeSubstCloner<SILInliner>(To, From, ApplySubs,
-                                    OpenedArchetypesTracker, true),
-        IKind(IKind), CalleeEntryBB(nullptr), CallSiteScope(nullptr),
-        Callback(Callback) {
+      : SuperTy(To, From, ApplySubs, OpenedArchetypesTracker, true),
+        IKind(IKind), CalleeFunction(&Original), Callback(Callback),
+	FuncBuilder(FuncBuilder) {
+    // CalleeEntryBB is initialized later in case the callee is modified.
   }
+
+  /// Returns true if we are able to inline \arg AI.
+  ///
+  /// *NOTE* This must be checked before attempting to inline \arg AI. If one
+  /// attempts to inline \arg AI and this returns false, an assert will fire.
+  bool canInlineFunction(FullApplySite AI);
 
   /// inlineFunction - This method inlines a callee function, assuming that it
   /// is called with the given arguments, into the caller at a given instruction
@@ -62,13 +91,19 @@ public:
   /// performs one step of inlining: it does not recursively inline functions
   /// called by the callee.
   ///
-  /// Returns true on success or false if it is unable to inline the function
-  /// (for any reason). If successful, I now points to the first inlined
-  /// instruction, or the next instruction after the removed instruction in the
-  /// original function, in case the inlined function is completely trivial
-  bool inlineFunction(FullApplySite AI, ArrayRef<SILValue> Args);
+  /// After completion, I now points to the first inlined instruction, or the
+  /// next instruction after the removed instruction in the original function,
+  /// in case the inlined function is completely trivial
+  ///
+  /// *NOTE*: This attempts to perform inlining unconditionally and thus asserts
+  /// if inlining will fail. All users /must/ check that a function is allowed
+  /// to be inlined using SILInliner::canInlineFunction before calling this
+  /// function.
+  void inlineFunction(FullApplySite AI, ArrayRef<SILValue> Args);
 
 private:
+  SILValue borrowFunctionArgument(SILValue callArg, FullApplySite AI);
+
   void visitDebugValueInst(DebugValueInst *Inst);
   void visitDebugValueAddrInst(DebugValueAddrInst *Inst);
 
@@ -103,22 +138,6 @@ private:
       // Create an inlined version of the scope.
       return getOrCreateInlineScope(DS);
   }
-
-  InlineKind IKind;
-  
-  SILBasicBlock *CalleeEntryBB;
-
-  /// \brief The location representing the inlined instructions.
-  ///
-  /// This location wraps the call site AST node that is being inlined.
-  /// Alternatively, it can be the SIL file location of the call site (in case
-  /// of SIL-to-SIL transformations).
-  Optional<SILLocation> Loc;
-  const SILDebugScope *CallSiteScope;
-  SILFunction *CalleeFunction;
-  llvm::SmallDenseMap<const SILDebugScope *,
-                      const SILDebugScope *> InlinedScopeCache;
-  CloneCollector::CallbackType Callback;
 };
 
 } // end namespace swift

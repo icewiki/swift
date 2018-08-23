@@ -229,7 +229,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForUnknownPreds() {
   // for method chaining code like obj.method1().method2().etc()
   auto *CCBI = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
   SILInstruction *Inst = &*CCBI->getFailureBB()->begin();
-  if (ClassMethodInst *CMI = dyn_cast<ClassMethodInst>(Inst)) {
+  if (auto *CMI = dyn_cast<ClassMethodInst>(Inst)) {
     if (CMI->getOperand() == stripClassCasts(CCBI->getOperand())) {
       // Replace checked_cast_br by branch to FailureBB.
       SILBuilder(CCBI->getParent()).createBranch(CCBI->getLoc(),
@@ -414,8 +414,8 @@ areEquivalentConditionsAlongSomePaths(CheckedCastBranchInst *DomCCBI,
       }
 
       // Condition is the same if BB is reached over a pass through Pred.
-      DEBUG(llvm::dbgs() << "Condition is the same if reached over ");
-      DEBUG(PredBB->print(llvm::dbgs()));
+      LLVM_DEBUG(llvm::dbgs() << "Condition is the same if reached over ");
+      LLVM_DEBUG(PredBB->print(llvm::dbgs()));
 
       // See if it is reached over Success or Failure path.
       SILBasicBlock *DomSuccessBB = DomCCBI->getSuccessBB();

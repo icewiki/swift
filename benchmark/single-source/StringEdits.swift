@@ -1,4 +1,4 @@
-//===--- StringEdits.swift-------------------------------------------------===//
+//===--- StringEdits.swift ------------------------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -17,28 +17,27 @@ import Glibc
 import Darwin
 #endif
 
+public let StringEdits = BenchmarkInfo(
+  name: "StringEdits",
+  runFunction: run_StringEdits,
+  tags: [.validation, .api, .String])
+
 var editWords: [String] = [
   "woodshed",
   "lakism",
   "gastroperiodynia",
 ]
 
-// FIXME: remove when String is a Collection
-extension String: RangeReplaceableCollection { }
-
 let alphabet = "abcdefghijklmnopqrstuvwxyz"
 /// All edits that are one edit away from `word`
 func edits(_ word: String) -> Set<String> {
-  // create right/left splits as CharacterViews instead
-  let splits = word.characters.indices.map {
-    (word.characters[word.characters.startIndex..<$0],word.characters[$0..<word.characters.endIndex])
+  let splits = word.indices.map {
+    (String(word[..<$0]), String(word[$0...]))
   }
   
-  // though it should be, CharacterView isn't hashable
-  // so using an array for now, ignore that aspect...
-  var result: [String.CharacterView] = []
+  var result: Array<String> = []
   
-  for (left,right) in splits {
+  for (left, right) in splits {
     // drop a character
     result.append(left + right.dropFirst())
     
@@ -62,7 +61,7 @@ func edits(_ word: String) -> Set<String> {
   }
   
   // have to map back to strings right at the end
-  return Set(result.lazy.map(String.init))
+  return Set(result)
 }
 
 @inline(never)

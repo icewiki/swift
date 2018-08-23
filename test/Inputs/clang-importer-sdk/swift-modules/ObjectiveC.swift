@@ -75,11 +75,11 @@ public struct NSZone {
   public var pointer : OpaquePointer
 }
 
-internal func _convertBoolToObjCBool(_ x: Bool) -> ObjCBool {
+public func _convertBoolToObjCBool(_ x: Bool) -> ObjCBool {
   return ObjCBool(x)
 }
 
-internal func _convertObjCBoolToBool(_ x: ObjCBool) -> Bool {
+public func _convertObjCBoolToBool(_ x: ObjCBool) -> Bool {
   return x.boolValue
 }
 
@@ -88,11 +88,12 @@ public func ~=(x: NSObject, y: NSObject) -> Bool {
 }
 
 extension NSObject : Equatable, Hashable {
-  public var hashValue: Int {
+  @objc open var hashValue: Int {
     return hash
+  }
+
+  public static func == (lhs: NSObject, rhs: NSObject) -> Bool {
+    return lhs.isEqual(rhs)
   }
 }
 
-public func == (lhs: NSObject, rhs: NSObject) -> Bool {
-  return lhs.isEqual(rhs)
-}

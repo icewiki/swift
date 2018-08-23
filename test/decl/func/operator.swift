@@ -142,6 +142,9 @@ func test_14705150() {
 
 }
 
+postfix operator ++
+prefix operator ++
+
 prefix postfix func ++(x: Int) {} // expected-error {{'postfix' contradicts previous modifier 'prefix'}} {{8-16=}}
 postfix prefix func ++(x: Float) {} // expected-error {{'prefix' contradicts previous modifier 'postfix'}} {{9-16=}}
 postfix prefix infix func ++(x: Double) {} // expected-error {{'prefix' contradicts previous modifier 'postfix'}} {{9-16=}} expected-error {{'infix' contradicts previous modifier 'postfix'}} {{16-22=}}
@@ -190,13 +193,13 @@ _ = n☃⃠☃⃠n     // expected-error {{ambiguous missing whitespace between 
 // expected-note @-1 {{could be binary '☃⃠' and prefix '☃⃠'}} {{12-12= }} {{18-18= }}
 // expected-note @-2 {{could be postfix '☃⃠' and binary '☃⃠'}} {{6-6= }} {{12-12= }}
 
-_ = n☃⃠☃⃠ // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = ~!n  // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = -+n  // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
-_ = -++n // expected-error {{unary operators may not be juxtaposed; parenthesize inner expression}}
+_ = n☃⃠☃⃠ // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = ~!n  // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = -+n  // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
+_ = -++n // expected-error {{unary operators must not be juxtaposed; parenthesize inner expression}}
 
 // <rdar://problem/16230507> Cannot use a negative constant as the second operator of ... operator
-_ = 3...-5  // expected-error {{missing whitespace between '...' and '-' operators}}
+_ = 3...-5  // expected-error {{ambiguous missing whitespace between unary and binary operators}} expected-note {{could be postfix '...' and binary '-'}} expected-note {{could be binary '...' and prefix '-'}}
 
 
 protocol P0 {
@@ -204,7 +207,7 @@ protocol P0 {
 }
 
 protocol P1 {
-  func %%%(lhs: Self, rhs: Self) -> Self // expected-warning{{operator '%%%' declared in protocol must be 'static'}}{{3-3=static }}
+  func %%%(lhs: Self, rhs: Self) -> Self // expected-error{{operator '%%%' declared in protocol must be 'static'}}{{3-3=static }}
 }
 
 struct S0 {
@@ -228,7 +231,7 @@ class C0 {
 }
 
 class C1 {
-  final func %%%(lhs: C1, rhs: C1) -> C1 { return lhs }
+  final func %%%(lhs: C1, rhs: C1) -> C1 { return lhs } // expected-error{{operator '%%%' declared in type 'C1' must be 'static'}}{{3-3=static }}
 }
 
 final class C2 {
@@ -352,6 +355,6 @@ class C6 {
   static func == (lhs: C6, rhs: C6) -> Bool { return false }
 
   func test1(x: C6) {
-    if x == x && x = x { } // expected-error{{cannot assign to value: '&&' returns immutable value}}
+    if x == x && x = x { } // expected-error{{expression is not assignable: '&&' returns immutable value}}
   }
 }

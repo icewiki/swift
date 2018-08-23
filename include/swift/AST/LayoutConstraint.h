@@ -31,7 +31,7 @@ class ASTContext;
 class ASTPrinter;
 
 /// Describes a layout constraint information.
-enum class LayoutConstraintKind : unsigned char {
+enum class LayoutConstraintKind : uint8_t {
   // It is not a known layout constraint.
   UnknownLayout,
   // It is a layout constraint representing a trivial type of an unknown size.
@@ -150,9 +150,25 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
     return SizeInBits;
   }
 
-  unsigned getAlignment() const {
-    assert(isKnownSizeTrivial());
+  unsigned getAlignmentInBits() const {
     return Alignment;
+  }
+
+  unsigned getAlignmentInBytes() const {
+    assert(isKnownSizeTrivial());
+    if (Alignment)
+      return Alignment;
+
+    // There is no explicitly defined alignment. Try to come up with a
+    // reasonable one.
+
+    // If the size is a power of 2, use it also for the default alignment.
+    auto SizeInBytes = getTrivialSizeInBytes();
+    if (llvm::isPowerOf2_32(SizeInBytes))
+      return SizeInBytes * 8;
+
+    // Otherwise assume the alignment of 8 bytes.
+    return 8*8;
   }
 
   operator bool() const {
@@ -222,7 +238,7 @@ class LayoutConstraintInfo : public llvm::FoldingSetNode {
                      AllocationArena arena, unsigned alignment = 8);
   void *operator new(size_t Bytes, void *Mem) throw() { return Mem; }
 
-  // Representation of the non-parametrized layouts.
+  // Representation of the non-parameterized layouts.
   static LayoutConstraintInfo UnknownLayoutConstraintInfo;
   static LayoutConstraintInfo RefCountedObjectConstraintInfo;
   static LayoutConstraintInfo NativeRefCountedObjectConstraintInfo;
@@ -260,7 +276,7 @@ class LayoutConstraint {
   LayoutConstraintInfo *operator->() const { return Ptr; }
 
   /// Merge these two constraints and return a more specific one
-  /// or fail if they’re incompatible and return an unknown constraint.
+  /// or fail if they're incompatible and return an unknown constraint.
   LayoutConstraint merge(LayoutConstraint Other);
 
   explicit operator bool() const { return Ptr != 0; }
@@ -379,7 +395,7 @@ template <> struct DenseMapInfo<swift::LayoutConstraint> {
 };
 
 // A LayoutConstraint is "pointer like".
-template <> class PointerLikeTypeTraits<swift::LayoutConstraint> {
+template <> struct PointerLikeTypeTraits<swift::LayoutConstraint> {
 public:
   static inline void *getAsVoidPointer(swift::LayoutConstraint I) {
     return (void *)I.getPointer();

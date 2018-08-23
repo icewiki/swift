@@ -18,7 +18,6 @@
 
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/Decl.h"
-#include "swift/AST/Substitution.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
@@ -48,15 +47,10 @@ typedef llvm::DenseMap<SubstitutableType *, Type> TypeSubstitutionMap;
 /// Map from non-type requirements to the corresponding conformance witnesses.
 typedef llvm::DenseMap<ValueDecl *, Witness> WitnessMap;
 
-/// Map from associated type requirements to the corresponding substitution,
-/// which captures the replacement type along with any conformances it requires.
-typedef llvm::DenseMap<AssociatedTypeDecl *, std::pair<Substitution, TypeDecl*>>
+/// Map from associated type requirements to the corresponding type and
+/// the type declaration that was used to satisfy the requirement.
+typedef llvm::DenseMap<AssociatedTypeDecl *, std::pair<Type, TypeDecl*>>
   TypeWitnessMap;
-
-/// Map from a directly-inherited protocol to its corresponding protocol
-/// conformance.
-typedef llvm::DenseMap<ProtocolDecl *, ProtocolConformance *>
-  InheritedConformanceMap;
 
 /// Describes the kind of protocol conformance structure used to encode
 /// conformance.
@@ -98,16 +92,10 @@ class alignas(1 << DeclAlignInBits) ProtocolConformance {
   /// \brief The type that conforms to the protocol, in the context of the
   /// conformance definition.
   Type ConformingType;
-  
-  /// \brief The interface type that conforms to the protocol.
-  Type ConformingInterfaceType;
-  
 
 protected:
-  ProtocolConformance(ProtocolConformanceKind kind, Type conformingType,
-                      Type conformingInterfaceType)
-    : Kind(kind), ConformingType(conformingType),
-      ConformingInterfaceType(conformingInterfaceType) { }
+  ProtocolConformance(ProtocolConformanceKind kind, Type conformingType)
+    : Kind(kind), ConformingType(conformingType) {}
 
 public:
   /// Determine the kind of protocol conformance.
@@ -116,9 +104,6 @@ public:
   /// Get the conforming type.
   Type getType() const { return ConformingType; }
 
-  /// Get the conforming interface type.
-  Type getInterfaceType() const { return ConformingInterfaceType; }
-  
   /// Get the protocol being conformed to.
   ProtocolDecl *getProtocol() const;
 
@@ -128,6 +113,11 @@ public:
 
   /// Retrieve the state of this conformance.
   ProtocolConformanceState getState() const;
+
+  /// Get the kind of source from which this conformance comes.
+  ConformanceEntryKind getSourceKind() const;
+  /// Get the protocol conformance which implied this implied conformance.
+  NormalProtocolConformance *getImplyingConformance() const;
 
   /// Determine whether this conformance is complete.
   bool isComplete() const {
@@ -144,26 +134,36 @@ public:
            getState() == ProtocolConformanceState::Checking;
   }
 
+  /// Determine whether this conformance is canonical.
+  bool isCanonical() const;
+
+  /// Create a canonical conformance from the current one.
+  /// If the current conformance is canonical already, it will be returned.
+  /// Otherwise a new conformance will be created.
+  ProtocolConformance *getCanonicalConformance();
+
   /// Return true if the conformance has a witness for the given associated
   /// type.
   bool hasTypeWitness(AssociatedTypeDecl *assocType,
                       LazyResolver *resolver = nullptr) const;
 
-  /// Retrieve the type witness substitution for the given associated type.
-  const Substitution &getTypeWitness(AssociatedTypeDecl *assocType,
-                                     LazyResolver *resolver) const;
+  /// Retrieve the type witness for the given associated type.
+  Type getTypeWitness(AssociatedTypeDecl *assocType,
+                      LazyResolver *resolver,
+                      SubstOptions options = None) const;
 
-  /// Retrieve the type witness substitution and type decl (if one exists)
+  /// Retrieve the type witness and type decl (if one exists)
   /// for the given associated type.
-  std::pair<const Substitution &, TypeDecl *>
-  getTypeWitnessSubstAndDecl(AssociatedTypeDecl *assocType,
-                             LazyResolver *resolver) const;
+  std::pair<Type, TypeDecl *>
+  getTypeWitnessAndDecl(AssociatedTypeDecl *assocType,
+                        LazyResolver *resolver,
+                        SubstOptions options = None) const;
 
   /// Apply the given function object to each type witness within this
   /// protocol conformance.
   ///
   /// The function object should accept an \c AssociatedTypeDecl* for the
-  /// requirement followed by the \c Substitution for the witness and a
+  /// requirement followed by the \c Type for the witness and a
   /// (possibly null) \c TypeDecl* that explicitly declared the type.
   /// It should return true to indicate an early exit.
   ///
@@ -180,7 +180,7 @@ public:
       if (!resolver && !hasTypeWitness(assocTypeReq))
         continue;
 
-      const auto &TWInfo = getTypeWitnessSubstAndDecl(assocTypeReq, resolver);
+      const auto &TWInfo = getTypeWitnessAndDecl(assocTypeReq, resolver);
       if (f(assocTypeReq, TWInfo.first, TWInfo.second))
         return true;
     }
@@ -188,47 +188,53 @@ public:
     return false;
   }
 
-  /// Retrieve the non-type witness for the given requirement.
-  Witness getWitness(ValueDecl *requirement, LazyResolver *resolver) const;
+  /// Retrieve the value witness declaration corresponding to the given
+  /// requirement.
+  ValueDecl *getWitnessDecl(ValueDecl *requirement,
+                            LazyResolver *resolver) const;
+
+  /// Retrieve the witness corresponding to the given value requirement.
+  /// TODO: maybe this should return a Witness?
+  ConcreteDeclRef getWitnessDeclRef(ValueDecl *requirement,
+                                    LazyResolver *resolver) const;
 
 private:
   /// Determine whether we have a witness for the given requirement.
   bool hasWitness(ValueDecl *requirement) const;
 
 public:
-  /// Apply the given function object to each value witness within this
-  /// protocol conformance.
+  /// Apply the given function object to each requirement, either type or value,
+  /// that is not witnessed.
   ///
-  /// The function object should accept a \c ValueDecl* for the requirement
-  /// followed by the \c Witness for the witness. Note that a generic
-  /// witness will only be specialized if the conformance came from the current
-  /// file.
+  /// The function object should accept a \c ValueDecl* for the requirement.
   template<typename F>
-  void forEachValueWitness(LazyResolver *resolver, F f) const {
+  void forEachNonWitnessedRequirement(LazyResolver *Resolver, F f) const {
     const ProtocolDecl *protocol = getProtocol();
     for (auto req : protocol->getMembers()) {
       auto valueReq = dyn_cast<ValueDecl>(req);
-      if (!valueReq || isa<AssociatedTypeDecl>(valueReq) ||
-          valueReq->isInvalid())
+      if (!valueReq || valueReq->isInvalid())
         continue;
+
+      if (auto assocTypeReq = dyn_cast<AssociatedTypeDecl>(req)) {
+        // If we don't have witness for the associated type, apply the function.
+        if (getTypeWitness(assocTypeReq, Resolver)->hasError()) {
+          f(valueReq);
+        }
+        continue;
+      }
 
       if (!valueReq->isProtocolRequirement())
         continue;
 
-      // If we don't have and cannot resolve witnesses, skip it.
-      if (!resolver && !hasWitness(valueReq))
-        continue;
-
-      f(valueReq, getWitness(valueReq, resolver));
+      // If we don't have witness for the value, apply the function.
+      if (!hasWitness(valueReq)) {
+        f(valueReq);
+      }
     }
   }
 
   /// Retrieve the protocol conformance for the inherited protocol.
   ProtocolConformance *getInheritedConformance(ProtocolDecl *protocol) const;
-
-  /// Retrieve the complete set of protocol conformances for directly inherited
-  /// protocols.
-  const InheritedConformanceMap &getInheritedConformances() const;
 
   /// Given a dependent type expressed in terms of the self parameter,
   /// map it into the context of this conformance.
@@ -241,13 +247,20 @@ public:
   ProtocolConformanceRef
   getAssociatedConformance(Type assocType, ProtocolDecl *protocol,
                            LazyResolver *resolver = nullptr) const;
- 
+
   /// Get the generic parameters open on the conforming type.
   GenericEnvironment *getGenericEnvironment() const;
 
   /// Get the generic signature containing the parameters open on the conforming
   /// interface type.
   GenericSignature *getGenericSignature() const;
+
+  /// Get the substitutions associated with this conformance.
+  SubstitutionMap getSubstitutions(ModuleDecl *M) const;
+
+  /// Determine whether the witness table access function for this conformance
+  /// needs to be passed information when called, or if it stands alone.
+  bool witnessTableAccessorRequiresArguments() const;
 
   /// Get the underlying normal conformance.
   const NormalProtocolConformance *getRootNormalConformance() const;
@@ -266,7 +279,7 @@ public:
   /// Determine whether the witness for the given requirement
   /// is either the default definition or was otherwise deduced.
   bool usesDefaultDefinition(AssociatedTypeDecl *requirement) const;
-  
+
   // Make vanilla new/delete illegal for protocol conformances.
   void *operator new(size_t bytes) = delete;
   void operator delete(void *data) SWIFT_DELETE_OPERATOR_DELETED;
@@ -280,24 +293,37 @@ public:
     assert(mem);
     return mem;
   }
-  
+
   /// Print a parseable and human-readable description of the identifying
   /// information of the protocol conformance.
   void printName(raw_ostream &os,
                  const PrintOptions &PO = PrintOptions()) const;
-  
+
   /// True if the conformance is for a property behavior instantiation.
   bool isBehaviorConformance() const;
-  
+
   /// Get the property declaration for a behavior conformance, if this is one.
   AbstractStorageDecl *getBehaviorDecl() const;
+
+  /// Get any additional requirements that are required for this conformance to
+  /// be satisfied, if it is possible for them to be computed.
+  Optional<ArrayRef<Requirement>> getConditionalRequirementsIfAvailable() const;
+
+  /// Get any additional requirements that are required for this conformance to
+  /// be satisfied.
+  ArrayRef<Requirement> getConditionalRequirements() const;
+
+  /// Substitute the conforming type and produce a ProtocolConformance that
+  /// applies to the substituted type.
+  ProtocolConformance *subst(Type substType,
+                             SubstitutionMap subMap) const;
 
   /// Substitute the conforming type and produce a ProtocolConformance that
   /// applies to the substituted type.
   ProtocolConformance *subst(Type substType,
                              TypeSubstitutionFn subs,
                              LookupConformanceFn conformances) const;
-  
+
   void dump() const;
   void dump(llvm::raw_ostream &out, unsigned indent = 0) const;
 };
@@ -336,57 +362,86 @@ class NormalProtocolConformance : public ProtocolConformance,
   /// Also stores the "invalid" bit.
   llvm::PointerIntPair<Context, 1, bool> ContextAndInvalid;
 
+  /// \brief The reason that this conformance exists.
+  ///
+  /// Either Explicit (e.g. 'struct Foo: Protocol {}' or 'extension Foo:
+  /// Protocol {}'), Synthesized (e.g. RawRepresentable for 'enum Foo: Int {}')
+  /// or Implied (e.g. 'Foo : Protocol' in 'protocol Other: Protocol {} struct
+  /// Foo: Other {}'). In only the latter case, the conformance is non-null and
+  /// points to the conformance that implies this one.
+  ///
+  /// This should never be Inherited: that is handled by
+  /// InheritedProtocolConformance.
+  llvm::PointerIntPair<NormalProtocolConformance *, 2, ConformanceEntryKind>
+      SourceKindAndImplyingConformance = {nullptr,
+                                          ConformanceEntryKind::Explicit};
+
   /// \brief The mapping of individual requirements in the protocol over to
   /// the declarations that satisfy those requirements.
   mutable WitnessMap Mapping;
 
-  /// The mapping from associated type requirements to their substitutions.
+  /// The mapping from associated type requirements to their types.
   mutable TypeWitnessMap TypeWitnesses;
-
-  /// \brief The mapping from any directly-inherited protocols over to the
-  /// protocol conformance structures that indicate how the given type meets
-  /// the requirements of those protocols.
-  InheritedConformanceMap InheritedMapping;
 
   /// Conformances that satisfy each of conformance requirements of the
   /// requirement signature of the protocol.
   ArrayRef<ProtocolConformanceRef> SignatureConformances;
 
-  LazyMemberLoader *Resolver = nullptr;
-  uint64_t ResolverContextData;
+  /// Any additional requirements that are required for this conformance to
+  /// apply, e.g. 'Something: Baz' in 'extension Foo: Bar where Something: Baz'.
+  mutable ArrayRef<Requirement> ConditionalRequirements;
+  enum class ConditionalRequirementsState {
+    Uncomputed,
+    Computing,
+    Complete,
+  };
+  /// The state of the ConditionalRequirements field: whether it has been
+  /// computed or not.
+  mutable ConditionalRequirementsState CRState =
+      ConditionalRequirementsState::Uncomputed;
 
+  /// The lazy member loader provides callbacks for populating imported and
+  /// deserialized conformances.
+  ///
+  /// This is not use for parsed conformances -- those are lazily populated
+  /// by the ASTContext's LazyResolver, which is really a Sema instance.
+  LazyConformanceLoader *Loader = nullptr;
+  uint64_t LoaderContextData;
   friend class ASTContext;
 
   NormalProtocolConformance(Type conformingType, ProtocolDecl *protocol,
                             SourceLoc loc, DeclContext *dc,
                             ProtocolConformanceState state)
-    : ProtocolConformance(ProtocolConformanceKind::Normal, conformingType,
-                          // FIXME: interface type should be passed in
-                          dc->getDeclaredInterfaceType()),
+    : ProtocolConformance(ProtocolConformanceKind::Normal, conformingType),
       ProtocolAndState(protocol, state), Loc(loc), ContextAndInvalid(dc, false)
   {
+    assert(!conformingType->hasArchetype() &&
+           "ProtocolConformances should store interface types");
+    differenceAndStoreConditionalRequirements();
   }
 
   NormalProtocolConformance(Type conformingType,
-                            Type conformingInterfaceType,
                             ProtocolDecl *protocol,
                             SourceLoc loc, AbstractStorageDecl *behaviorStorage,
                             ProtocolConformanceState state)
-    : ProtocolConformance(ProtocolConformanceKind::Normal, conformingType,
-                          // FIXME: interface type should be passed in
-                          conformingInterfaceType),
+    : ProtocolConformance(ProtocolConformanceKind::Normal, conformingType),
       ProtocolAndState(protocol, state), Loc(loc),
       ContextAndInvalid(behaviorStorage, false)
   {
+    assert(!conformingType->hasArchetype() &&
+           "ProtocolConformances should store interface types");
+    differenceAndStoreConditionalRequirements();
   }
 
   void resolveLazyInfo() const;
+
+  void differenceAndStoreConditionalRequirements() const;
 
 public:
   /// Get the protocol being conformed to.
   ProtocolDecl *getProtocol() const { return ProtocolAndState.getPointer(); }
 
-  /// Retrieve the location of this 
+  /// Retrieve the location of this
   SourceLoc getLoc() const { return Loc; }
 
   /// Get the declaration context that contains the conforming extension or
@@ -398,6 +453,40 @@ public:
     } else {
       return context.get<AbstractStorageDecl *>()->getDeclContext();
     }
+  }
+
+  /// Get any additional requirements that are required for this conformance to
+  /// be satisfied if they can be computed.
+  ///
+  /// If \c computeIfPossible is false, this will not do the lazy computation of
+  /// the conditional requirements and will just query the current state. This
+  /// should almost certainly only be used for debugging purposes, prefer \c
+  /// getConditionalRequirementsIfAvailable (these are separate because
+  /// CONFORMANCE_SUBCLASS_DISPATCH does some type checks and a defaulted
+  /// parameter gets in the way of that).
+  Optional<ArrayRef<Requirement>>
+  getConditionalRequirementsIfAvailableOrCached(bool computeIfPossible) const {
+    if (computeIfPossible)
+      differenceAndStoreConditionalRequirements();
+
+    if (CRState == ConditionalRequirementsState::Complete)
+      return ConditionalRequirements;
+
+    return None;
+  }
+  /// Get any additional requirements that are required for this conformance to
+  /// be satisfied if they can be computed.
+  Optional<ArrayRef<Requirement>>
+  getConditionalRequirementsIfAvailable() const {
+    return getConditionalRequirementsIfAvailableOrCached(
+        /*computeIfPossible=*/true);
+  }
+
+  /// Get any additional requirements that are required for this conformance to
+  /// be satisfied, e.g. for Array<T>: Equatable, T: Equatable also needs
+  /// to be satisfied.
+  ArrayRef<Requirement> getConditionalRequirements() const {
+    return *getConditionalRequirementsIfAvailable();
   }
 
   /// Retrieve the state of this conformance.
@@ -414,33 +503,66 @@ public:
   bool isInvalid() const {
     return ContextAndInvalid.getInt();
   }
-  
+
   /// Mark this conformance as invalid.
   void setInvalid() {
     ContextAndInvalid.setInt(true);
+    SignatureConformances = {};
   }
 
-  /// Determine whether this conformance is lazily resolved.
+  /// Get the kind of source from which this conformance comes.
+  ConformanceEntryKind getSourceKind() const {
+    return SourceKindAndImplyingConformance.getInt();
+  }
+
+  /// Get the protocol conformance which implied this implied conformance.
+  NormalProtocolConformance *getImplyingConformance() const {
+    assert(getSourceKind() == ConformanceEntryKind::Implied);
+    return SourceKindAndImplyingConformance.getPointer();
+  }
+
+  void setSourceKindAndImplyingConformance(
+      ConformanceEntryKind sourceKind,
+      NormalProtocolConformance *implyingConformance) {
+    assert(sourceKind != ConformanceEntryKind::Inherited &&
+           "a normal conformance cannot be inherited");
+    assert((sourceKind == ConformanceEntryKind::Implied) ==
+               (bool)implyingConformance &&
+           "an implied conformance needs something that implies it");
+    SourceKindAndImplyingConformance = {implyingConformance, sourceKind};
+  }
+
+  /// Determine whether this conformance is lazily loaded.
   ///
   /// This only matters to the AST verifier.
-  bool isLazilyResolved() const { return Resolver != nullptr; }
+  bool isLazilyLoaded() const { return Loader != nullptr; }
 
   /// True if the conformance describes a property behavior.
   bool isBehaviorConformance() const {
     return ContextAndInvalid.getPointer().is<AbstractStorageDecl *>();
   }
-  
+
   /// Return the declaration using the behavior for this conformance, or null
   /// if this isn't a behavior conformance.
   AbstractStorageDecl *getBehaviorDecl() const {
     return ContextAndInvalid.getPointer().dyn_cast<AbstractStorageDecl *>();
   }
-  
-  /// Retrieve the type witness substitution and type decl (if one exists)
+
+  /// A "retroactive" conformance is one that is defined in a module that
+  /// is neither the module that defines the protocol nor the module that
+  /// defines the conforming type.
+  bool isRetroactive() const;
+
+  /// Whether this conformance was synthesized automatically in multiple
+  /// modules, but in a manner that ensures that all copies are equivalent.
+  bool isSynthesizedNonUnique() const;
+
+  /// Retrieve the type witness and type decl (if one exists)
   /// for the given associated type.
-  std::pair<const Substitution &, TypeDecl *>
-  getTypeWitnessSubstAndDecl(AssociatedTypeDecl *assocType,
-                             LazyResolver *resolver) const;
+  std::pair<Type, TypeDecl *>
+  getTypeWitnessAndDecl(AssociatedTypeDecl *assocType,
+                        LazyResolver *resolver,
+                        SubstOptions options = None) const;
 
   /// Determine whether the protocol conformance has a type witness for the
   /// given associated type.
@@ -449,8 +571,7 @@ public:
 
   /// Set the type witness for the given associated type.
   /// \param typeDecl the type decl the witness type came from, if one exists.
-  void setTypeWitness(AssociatedTypeDecl *assocType,
-                      const Substitution &substitution,
+  void setTypeWitness(AssociatedTypeDecl *assocType, Type type,
                       TypeDecl *typeDecl) const;
 
   /// Given that the requirement signature of the protocol directly states
@@ -461,17 +582,14 @@ public:
                            LazyResolver *resolver = nullptr) const;
 
   /// Retrieve the value witness corresponding to the given requirement.
-  ///
-  /// Note that a generic witness will only be specialized if the conformance
-  /// came from the current file.
-  ///
-  /// FIXME: The 'only specialized if from the same file' bit is awful.
   Witness getWitness(ValueDecl *requirement, LazyResolver *resolver) const;
+  ConcreteDeclRef getWitnessDeclRef(ValueDecl *requirement,
+                                    LazyResolver *resolver) const;
 
   /// Determine whether the protocol conformance has a witness for the given
   /// requirement.
   bool hasWitness(ValueDecl *requirement) const {
-    if (Resolver)
+    if (Loader)
       resolveLazyInfo();
     return Mapping.count(requirement) > 0;
   }
@@ -479,32 +597,39 @@ public:
   /// Set the witness for the given requirement.
   void setWitness(ValueDecl *requirement, Witness witness) const;
 
-  /// Retrieve the protocol conformances directly-inherited protocols.
-  const InheritedConformanceMap &getInheritedConformances() const {
-    return InheritedMapping;
-  }
-
-  /// Determine whether the protocol conformance has a particular inherited
-  /// conformance.
+  /// Apply the given function object to each value witness within this
+  /// protocol conformance.
   ///
-  /// Only usable on incomplete or invalid protocol conformances.
-  bool hasInheritedConformance(ProtocolDecl *proto) const {
-    return InheritedMapping.count(proto) > 0;
-  }
+  /// The function object should accept a \c ValueDecl* for the requirement
+  /// followed by the \c Witness for the witness. Note that a generic
+  /// witness will only be specialized if the conformance came from the current
+  /// file.
+  template<typename F>
+  void forEachValueWitness(LazyResolver *resolver, F f) const {
+    const ProtocolDecl *protocol = getProtocol();
+    for (auto req : protocol->getMembers()) {
+      auto valueReq = dyn_cast<ValueDecl>(req);
+      if (!valueReq || isa<AssociatedTypeDecl>(valueReq) ||
+          valueReq->isInvalid())
+        continue;
 
-  /// Set the given inherited conformance.
-  void setInheritedConformance(ProtocolDecl *proto,
-                               ProtocolConformance *conformance) {
-    assert(InheritedMapping.count(proto) == 0 &&
-           "Already recorded inherited conformance");
-    assert(!isComplete() && "Conformance already complete?");
-    InheritedMapping[proto] = conformance;
+      if (!valueReq->isProtocolRequirement())
+        continue;
+
+      // If we don't have and cannot resolve witnesses, skip it.
+      if (!resolver && !hasWitness(valueReq))
+        continue;
+
+      f(valueReq, getWitness(valueReq, resolver));
+    }
   }
 
   /// Retrieve the protocol conformances that satisfy the requirements of the
   /// protocol, which line up with the conformance constraints in the
   /// protocol's requirement signature.
   ArrayRef<ProtocolConformanceRef> getSignatureConformances() const {
+    if (Loader)
+      resolveLazyInfo();
     return SignatureConformances;
   }
 
@@ -512,14 +637,27 @@ public:
   /// the normal conformance.
   void setSignatureConformances(ArrayRef<ProtocolConformanceRef> conformances);
 
+  /// Retrieves a function object that should be called with each of the
+  /// conformances required by the requirement signature.
+  ///
+  /// This can be used to iteratively build up the signature conformances in
+  /// the type checker (rather than emitting them in a batch via
+  /// \c setSignatureConformances). The callee is responsible for calling
+  /// the returned function object with protocol conformances that line up
+  /// with the conformance requirements in the requirement signature (in order).
+  std::function<void(ProtocolConformanceRef)> populateSignatureConformances();
+
   /// Determine whether the witness for the given type requirement
   /// is the default definition.
   bool usesDefaultDefinition(AssociatedTypeDecl *requirement) const {
-    return getTypeWitnessSubstAndDecl(requirement, nullptr)
-        .second->isImplicit();
+    TypeDecl *witnessDecl = getTypeWitnessAndDecl(requirement, nullptr).second;
+    if (witnessDecl)
+      return witnessDecl->isImplicit();
+    // Conservatively assume it does not.
+    return false;
   }
 
-  void setLazyLoader(LazyMemberLoader *resolver, uint64_t contextData);
+  void setLazyLoader(LazyConformanceLoader *resolver, uint64_t contextData);
 
   void Profile(llvm::FoldingSetNodeID &ID) {
     Profile(ID, getProtocol(), getDeclContext());
@@ -557,7 +695,7 @@ class SpecializedProtocolConformance : public ProtocolConformance,
 
   /// The substitutions applied to the generic conformance to produce this
   /// conformance.
-  SubstitutionList GenericSubstitutions;
+  SubstitutionMap GenericSubstitutions;
 
   /// The mapping from associated type requirements to their substitutions.
   ///
@@ -565,11 +703,17 @@ class SpecializedProtocolConformance : public ProtocolConformance,
   /// generic conformance.
   mutable TypeWitnessMap TypeWitnesses;
 
+  /// Any conditional requirements, in substituted form. (E.g. given Foo<T>: Bar
+  /// where T: Bar, Foo<Baz<U>> will include Baz<U>: Bar.)
+  mutable Optional<ArrayRef<Requirement>> ConditionalRequirements;
+
   friend class ASTContext;
 
   SpecializedProtocolConformance(Type conformingType,
                                  ProtocolConformance *genericConformance,
-                                 SubstitutionList substitutions);
+                                 SubstitutionMap substitutions);
+
+  void computeConditionalRequirements() const;
 
 public:
   /// Get the generic conformance from which this conformance was derived,
@@ -578,10 +722,33 @@ public:
     return GenericConformance;
   }
 
-  /// Get the substitutions used to produce this specialized conformance from
-  /// the generic conformance.
-  SubstitutionList getGenericSubstitutions() const {
-    return GenericSubstitutions;
+  /// Get the substitution map representing the substitutions used to produce
+  /// this specialized conformance.
+  SubstitutionMap getSubstitutionMap() const { return GenericSubstitutions; }
+
+  /// Get any requirements that must be satisfied for this conformance to apply.
+  ///
+  /// If \c computeIfPossible is false, this will not do the lazy computation of
+  /// the conditional requirements and will just query the current state. This
+  /// should almost certainly only be used for debugging purposes, prefer \c
+  /// getConditionalRequirementsIfAvailable (these are separate because
+  /// CONFORMANCE_SUBCLASS_DISPATCH does some type checks and a defaulted
+  /// parameter gets in the way of that).
+  Optional<ArrayRef<Requirement>>
+  getConditionalRequirementsIfAvailableOrCached(bool computeIfPossible) const {
+    if (computeIfPossible)
+      computeConditionalRequirements();
+    return ConditionalRequirements;
+  }
+  Optional<ArrayRef<Requirement>>
+  getConditionalRequirementsIfAvailable() const {
+    return getConditionalRequirementsIfAvailableOrCached(
+        /*computeIfPossible=*/true);
+  }
+
+  /// Get any requirements that must be satisfied for this conformance to apply.
+  ArrayRef<Requirement> getConditionalRequirements() const {
+    return *getConditionalRequirementsIfAvailable();
   }
 
   /// Get the protocol being conformed to.
@@ -600,23 +767,24 @@ public:
     return GenericConformance->getState();
   }
 
+  /// Get the kind of source from which this conformance comes.
+  ConformanceEntryKind getSourceKind() const {
+    return GenericConformance->getSourceKind();
+  }
+  /// Get the protocol conformance which implied this implied conformance.
+  NormalProtocolConformance *getImplyingConformance() const {
+    return GenericConformance->getImplyingConformance();
+  }
+
   bool hasTypeWitness(AssociatedTypeDecl *assocType,
                       LazyResolver *resolver = nullptr) const;
 
-  /// Retrieve the type witness substitution and type decl (if one exists)
+  /// Retrieve the type witness and type decl (if one exists)
   /// for the given associated type.
-  std::pair<const Substitution &, TypeDecl *>
-  getTypeWitnessSubstAndDecl(AssociatedTypeDecl *assocType,
-                             LazyResolver *resolver) const;
-
-  /// Retrieve the value witness corresponding to the given requirement.
-  Witness getWitness(ValueDecl *requirement, LazyResolver *resolver) const;
-
-
-  /// Retrieve the protocol conformances directly-inherited protocols.
-  const InheritedConformanceMap &getInheritedConformances() const {
-    return GenericConformance->getInheritedConformances();
-  }
+  std::pair<Type, TypeDecl *>
+  getTypeWitnessAndDecl(AssociatedTypeDecl *assocType,
+                        LazyResolver *resolver,
+                        SubstOptions options = None) const;
 
   /// Given that the requirement signature of the protocol directly states
   /// that the given dependent type must conform to the given protocol,
@@ -625,6 +793,10 @@ public:
   getAssociatedConformance(Type assocType, ProtocolDecl *protocol,
                            LazyResolver *resolver = nullptr) const;
 
+  /// Retrieve the witness corresponding to the given value requirement.
+  ConcreteDeclRef getWitnessDeclRef(ValueDecl *requirement,
+                                    LazyResolver *resolver) const;
+
   /// Determine whether the witness for the given requirement
   /// is either the default definition or was otherwise deduced.
   bool usesDefaultDefinition(AssociatedTypeDecl *requirement) const {
@@ -632,17 +804,15 @@ public:
   }
 
   void Profile(llvm::FoldingSetNodeID &ID) {
-    Profile(ID, getType(), getGenericConformance());
+    Profile(ID, getType(), getGenericConformance(), getSubstitutionMap());
   }
 
   static void Profile(llvm::FoldingSetNodeID &ID, Type type,
-                      ProtocolConformance *genericConformance) {
-    // FIXME: Consider profiling substitutions here. They could differ in
-    // some crazy cases that also require major diagnostic work, where the
-    // substitutions involve conformances of the same type to the same
-    // protocol drawn from different imported modules.
+                      ProtocolConformance *genericConformance,
+                      SubstitutionMap subs) {
     ID.AddPointer(type.getPointer());
     ID.AddPointer(genericConformance);
+    subs.profile(ID);
   }
 
   static bool classof(const ProtocolConformance *conformance) {
@@ -671,9 +841,7 @@ class InheritedProtocolConformance : public ProtocolConformance,
 
   InheritedProtocolConformance(Type conformingType,
                                ProtocolConformance *inheritedConformance)
-    : ProtocolConformance(ProtocolConformanceKind::Inherited, conformingType,
-            // FIXME: interface type should be passed in
-            inheritedConformance->getDeclContext()->getDeclaredInterfaceType()),
+    : ProtocolConformance(ProtocolConformanceKind::Inherited, conformingType),
       InheritedConformance(inheritedConformance)
   {
   }
@@ -687,6 +855,17 @@ public:
   /// Get the protocol being conformed to.
   ProtocolDecl *getProtocol() const {
     return InheritedConformance->getProtocol();
+  }
+
+  /// Get any requirements that must be satisfied for this conformance to apply.
+  Optional<ArrayRef<Requirement>>
+  getConditionalRequirementsIfAvailable() const {
+    return InheritedConformance->getConditionalRequirementsIfAvailable();
+  }
+
+  /// Get any requirements that must be satisfied for this conformance to apply.
+  ArrayRef<Requirement> getConditionalRequirements() const {
+    return InheritedConformance->getConditionalRequirements();
   }
 
   /// Get the declaration context that contains the conforming extension or
@@ -704,23 +883,26 @@ public:
     return InheritedConformance->getState();
   }
 
+  /// Get the kind of source from which this conformance comes.
+  ConformanceEntryKind getSourceKind() const {
+    return ConformanceEntryKind::Inherited;
+  }
+  /// Get the protocol conformance which implied this implied conformance.
+  NormalProtocolConformance *getImplyingConformance() const { return nullptr; }
+
   bool hasTypeWitness(AssociatedTypeDecl *assocType,
                       LazyResolver *resolver = nullptr) const {
     return InheritedConformance->hasTypeWitness(assocType, resolver);
   }
 
-  /// Retrieve the type witness substitution and type decl (if one exists)
+  /// Retrieve the type witness and type decl (if one exists)
   /// for the given associated type.
-  std::pair<const Substitution &, TypeDecl *>
-  getTypeWitnessSubstAndDecl(AssociatedTypeDecl *assocType,
-                             LazyResolver *resolver) const {
-    return InheritedConformance->getTypeWitnessSubstAndDecl(assocType,resolver);
-  }
-
-  /// Retrieve the value witness corresponding to the given requirement.
-  Witness getWitness(ValueDecl *requirement, LazyResolver *resolver) const {
-    // FIXME: Substitute!
-    return InheritedConformance->getWitness(requirement, resolver);
+  std::pair<Type, TypeDecl *>
+  getTypeWitnessAndDecl(AssociatedTypeDecl *assocType,
+                        LazyResolver *resolver,
+                        SubstOptions options = None) const {
+    return InheritedConformance->getTypeWitnessAndDecl(assocType, resolver,
+                                                       options);
   }
 
   /// Given that the requirement signature of the protocol directly states
@@ -730,10 +912,9 @@ public:
   getAssociatedConformance(Type assocType, ProtocolDecl *protocol,
                            LazyResolver *resolver = nullptr) const;
 
-  /// Retrieve the protocol conformances directly-inherited protocols.
-  const InheritedConformanceMap &getInheritedConformances() const {
-    return InheritedConformance->getInheritedConformances();
-  }
+  /// Retrieve the witness corresponding to the given value requirement.
+  ConcreteDeclRef getWitnessDeclRef(ValueDecl *requirement,
+                                    LazyResolver *resolver) const;
 
   /// Determine whether the witness for the given requirement
   /// is either the default definition or was otherwise deduced.
@@ -747,7 +928,7 @@ public:
 
   static void Profile(llvm::FoldingSetNodeID &ID, Type type,
                       ProtocolConformance *inheritedConformance) {
-    ID.AddPointer(type->getCanonicalType().getPointer());
+    ID.AddPointer(type.getPointer());
     ID.AddPointer(inheritedConformance);
   }
 

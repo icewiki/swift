@@ -33,6 +33,9 @@ namespace swift {
   /// \returns true if the diagnostic passes produced an error
   bool runSILDiagnosticPasses(SILModule &M);
 
+  /// \brief Prepare SIL for the -O pipeline.
+  void runSILOptPreparePasses(SILModule &Module);
+
   /// \brief Run all the SIL performance optimization passes on \p M.
   void runSILOptimizationPasses(SILModule &M);
 
@@ -47,39 +50,32 @@ namespace swift {
 
   /// \brief Detect and remove unreachable code. Diagnose provably unreachable
   /// user code.
-  void performSILDiagnoseUnreachable(SILModule *M, SILModuleTransform *T);
+  void performSILDiagnoseUnreachable(SILModule *M);
 
   /// \brief Remove dead functions from \p M.
   void performSILDeadFunctionElimination(SILModule *M);
 
-  /// \brief Link a SILFunction declaration to the actual definition in the
-  /// serialized modules.
-  ///
-  /// \param M the SILModule on which to operate
-  /// \param LinkAll when true, always link. For testing purposes.
-  void performSILLinking(SILModule *M, bool LinkAll = false);
-
   /// \brief Convert SIL to a lowered form suitable for IRGen.
   void runSILLoweringPasses(SILModule &M);
 
-  /// \brief Perform SIL Inst Count on M.
-  void performSILInstCount(SILModule *M);
+  /// \brief Perform SIL Inst Count on M if needed.
+  void performSILInstCountIfNeeded(SILModule *M);
 
   /// \brief Identifiers for all passes. Used to procedurally create passes from
   /// lists of passes.
   enum class PassKind {
-#define PASS(ID, NAME, DESCRIPTION) ID,
+#define PASS(ID, TAG, NAME) ID,
 #define PASS_RANGE(ID, START, END) ID##_First = START, ID##_Last = END,
 #include "Passes.def"
     invalidPassKind
   };
 
   PassKind PassKindFromString(StringRef ID);
-  StringRef PassKindName(PassKind Kind);
   StringRef PassKindID(PassKind Kind);
+  StringRef PassKindTag(PassKind Kind);
 
-#define PASS(ID, NAME, DESCRIPTION) SILTransform *create##ID();
-#define IRGEN_PASS(ID, NAME, DESCRIPTION)
+#define PASS(ID, TAG, NAME) SILTransform *create##ID();
+#define IRGEN_PASS(ID, TAG, NAME)
 #include "Passes.def"
 
 } // end namespace swift

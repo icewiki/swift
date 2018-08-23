@@ -15,7 +15,7 @@
 #include "swift/Runtime/Concurrent.h"
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/HeapObject.h"
-#include "swift/Runtime/Metadata.h"
+#include "swift/Runtime/Casting.h"
 #include "Private.h"
 #include "SwiftValue.h"
 #include "SwiftHashableSupport.h"
@@ -123,16 +123,22 @@ const Metadata *swift::hashable_support::findHashableBaseType(
   return findHashableBaseTypeImpl</*KnownToConformToHashable=*/ false>(type);
 }
 
-SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
-void _swift_stdlib_makeAnyHashableUsingDefaultRepresentation(
+// internal func _makeAnyHashableUsingDefaultRepresentation<H : Hashable>(
+//   of value: H,
+//   storingResultInto result: UnsafeMutablePointer<AnyHashable>)
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_makeAnyHashableUsingDefaultRepresentation(
   const OpaqueValue *value,
   const void *anyHashableResultPointer,
   const Metadata *T,
   const WitnessTable *hashableWT
 );
 
-SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
-void _swift_stdlib_makeAnyHashableUpcastingToHashableBaseType(
+// public func _makeAnyHashableUpcastingToHashableBaseType<H : Hashable>(
+//   _ value: H,
+//   storingResultInto result: UnsafeMutablePointer<AnyHashable>)
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_makeAnyHashableUpcastingToHashableBaseType(
   OpaqueValue *value,
   const void *anyHashableResultPointer,
   const Metadata *type,
@@ -154,70 +160,26 @@ void _swift_stdlib_makeAnyHashableUpcastingToHashableBaseType(
           getValueFromSwiftValue(srcSwiftValue);
 
       if (auto unboxedHashableWT =
-              swift_conformsToProtocol(type, &HashableProtocolDescriptor)) {
-#ifdef SWIFT_RUNTIME_ENABLE_COW_EXISTENTIALS
-        ValueBuffer unboxedCopyBuf;
-        // Allocate buffer.
-        OpaqueValue *unboxedValueCopy =
-            unboxedType->allocateBufferIn(&unboxedCopyBuf);
-        // initWithCopy.
-        unboxedType->vw_initializeWithCopy(
-            unboxedValueCopy, const_cast<OpaqueValue *>(unboxedValue));
-
-        _swift_stdlib_makeAnyHashableUpcastingToHashableBaseType(
-            unboxedValueCopy, anyHashableResultPointer, unboxedType,
-            unboxedHashableWT);
-        // Deallocate buffer.
-        unboxedType->deallocateBufferIn(&unboxedCopyBuf);
-        type->vw_destroy(value);
-#else
-        ValueBuffer unboxedCopyBuf;
-        auto unboxedValueCopy = unboxedType->vw_initializeBufferWithCopy(
-            &unboxedCopyBuf, const_cast<OpaqueValue *>(unboxedValue));
-        _swift_stdlib_makeAnyHashableUpcastingToHashableBaseType(
-            unboxedValueCopy, anyHashableResultPointer, unboxedType,
-            unboxedHashableWT);
-        unboxedType->vw_deallocateBuffer(&unboxedCopyBuf);
-        type->vw_destroy(value);
-#endif
+              swift_conformsToProtocol(unboxedType, &HashableProtocolDescriptor)) {
+        _swift_makeAnyHashableUpcastingToHashableBaseType(
+            const_cast<OpaqueValue *>(unboxedValue), anyHashableResultPointer,
+            unboxedType, unboxedHashableWT);
         return;
       }
     }
 #endif
 
-    _swift_stdlib_makeAnyHashableUsingDefaultRepresentation(
+    _swift_makeAnyHashableUsingDefaultRepresentation(
         value, anyHashableResultPointer,
         findHashableBaseTypeOfHashableType(type),
         hashableWT);
     return;
   }
 
-  case MetadataKind::Struct:
-  case MetadataKind::Enum:
-  case MetadataKind::Optional:
-    _swift_stdlib_makeAnyHashableUsingDefaultRepresentation(
+  default:
+    _swift_makeAnyHashableUsingDefaultRepresentation(
         value, anyHashableResultPointer, type, hashableWT);
     return;
-
-  case MetadataKind::ErrorObject:
-    // ErrorObject metadata is not used for any Swift-level values, so
-    // this case is unreachable.
-    _failCorruptType(type);
-
-  case MetadataKind::Opaque:
-  case MetadataKind::Tuple:
-  case MetadataKind::Function:
-  case MetadataKind::Existential:
-  case MetadataKind::Metatype:
-  case MetadataKind::ExistentialMetatype:
-  case MetadataKind::HeapLocalVariable:
-  case MetadataKind::HeapGenericLocalVariable:
-    // We assume that the value can not be an existential,
-    // because existentials can't conform to Hashable today.
-    //
-    // FIXME: handle generalized existentials when Swift has them.
-    _failCorruptType(type);
   }
-  _failCorruptType(type);
 }
 

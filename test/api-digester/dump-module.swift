@@ -1,7 +1,15 @@
-// RUN: rm -rf %t.mod && mkdir -p %t.mod
-// RUN: rm -rf %t.sdk && mkdir -p %t.sdk
-// RUN: rm -rf %t.module-cache && mkdir -p %t.module-cache
+// RUN: %empty-directory(%t.mod)
+// RUN: %empty-directory(%t.sdk)
+// RUN: %empty-directory(%t.module-cache)
 // RUN: %swift -emit-module -o %t.mod/cake.swiftmodule %S/Inputs/cake.swift -parse-as-library
-// RUN: %api-digester -dump-sdk -module cake -o %t.dump.json -module-cache-path %t.module-cache -sdk %t.sdk -swift-version 3 -I %t.mod
-// RUN: diff -u %t.dump.json %S/Outputs/cake.json
+// RUN: %api-digester -dump-sdk -module cake -o %t.dump.json -module-cache-path %t.module-cache -sdk %t.sdk -I %t.mod
+// RUN: diff -u %S/Outputs/cake.json %t.dump.json
+// RUN: %api-digester -dump-sdk -module cake -o %t.dump.json -module-cache-path %t.module-cache -sdk %t.sdk -I %t.mod -abi
+// RUN: diff -u %S/Outputs/cake-abi.json %t.dump.json
 // RUN: %api-digester -diagnose-sdk --input-paths %t.dump.json -input-paths %S/Outputs/cake.json
+
+// Round-trip testing:
+// RUN: %api-digester -deserialize-sdk --input-paths %S/Outputs/cake.json -o %t.dump.json
+// RUN: diff -u %S/Outputs/cake.json %t.dump.json
+// RUN: %api-digester -deserialize-sdk --input-paths %S/Outputs/cake-abi.json -o %t.dump.json
+// RUN: diff -u %S/Outputs/cake-abi.json %t.dump.json

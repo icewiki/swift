@@ -22,6 +22,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/DiagnosticsSema.h"
+#include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/LinkLibrary.h"
@@ -33,6 +34,8 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Parse/Token.h"
+#include "swift/Syntax/SyntaxNodes.h"
 #include "clang/Basic/Module.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -87,7 +90,7 @@ void BuiltinUnit::LookupCache::lookupValue(
                                           /*genericparams*/nullptr,
                                           const_cast<BuiltinUnit*>(&M));
       TAD->setUnderlyingType(Ty);
-      TAD->setAccessibility(Accessibility::Public);
+      TAD->setAccess(AccessLevel::Public);
       Entry = TAD;
     }
   }
@@ -180,23 +183,29 @@ template<typename Range>
 void SourceLookupCache::doPopulateCache(Range decls,
                                         bool onlyOperators) {
   for (Decl *D : decls) {
-    if (ValueDecl *VD = dyn_cast<ValueDecl>(D))
+    if (auto *VD = dyn_cast<ValueDecl>(D))
       if (onlyOperators ? VD->isOperator() : VD->hasName()) {
         // Cache the value under both its compound name and its full name.
         TopLevelValues.add(VD);
       }
-    if (NominalTypeDecl *NTD = dyn_cast<NominalTypeDecl>(D))
+    if (auto *NTD = dyn_cast<NominalTypeDecl>(D))
       doPopulateCache(NTD->getMembers(), true);
-    if (ExtensionDecl *ED = dyn_cast<ExtensionDecl>(D))
+
+    // Avoid populating the cache with the members of invalid extension
+    // declarations.  These members can be used to point validation inside of
+    // a malformed context.
+    if (D->isInvalid()) continue;
+
+    if (auto *ED = dyn_cast<ExtensionDecl>(D))
       doPopulateCache(ED->getMembers(), true);
   }
 }
 
 void SourceLookupCache::populateMemberCache(const SourceFile &SF) {
   for (const Decl *D : SF.Decls) {
-    if (const NominalTypeDecl *NTD = dyn_cast<NominalTypeDecl>(D)) {
+    if (const auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
       addToMemberCache(NTD->getMembers());
-    } else if (const ExtensionDecl *ED = dyn_cast<ExtensionDecl>(D)) {
+    } else if (const auto *ED = dyn_cast<ExtensionDecl>(D)) {
       addToMemberCache(ED->getMembers());
     }
   }
@@ -282,10 +291,9 @@ void SourceLookupCache::lookupClassMembers(AccessPathTy accessPath,
         continue;
 
       for (ValueDecl *vd : member.second) {
-        Type ty = vd->getDeclContext()->getDeclaredTypeOfContext();
-        if (auto nominal = ty->getAnyNominal())
-          if (nominal->getName() == accessPath.front().first)
-            consumer.foundDecl(vd, DeclVisibilityKind::DynamicLookup);
+        auto *nominal = vd->getDeclContext()->getSelfNominalTypeDecl();
+        if (nominal && nominal->getName() == accessPath.front().first)
+          consumer.foundDecl(vd, DeclVisibilityKind::DynamicLookup);
       }
     }
     return;
@@ -317,10 +325,9 @@ void SourceLookupCache::lookupClassMember(AccessPathTy accessPath,
   
   if (!accessPath.empty()) {
     for (ValueDecl *vd : iter->second) {
-      Type ty = vd->getDeclContext()->getDeclaredTypeOfContext();
-      if (auto nominal = ty->getAnyNominal())
-        if (nominal->getName() == accessPath.front().first)
-          results.push_back(vd);
+      auto *nominal = vd->getDeclContext()->getSelfNominalTypeDecl();
+      if (nominal && nominal->getName() == accessPath.front().first)
+        results.push_back(vd);
     }
     return;
   }
@@ -343,13 +350,17 @@ void SourceLookupCache::invalidate() {
 //===----------------------------------------------------------------------===//
 
 ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx)
-  : TypeDecl(DeclKind::Module, &ctx, name, SourceLoc(), { }),
-    DeclContext(DeclContextKind::Module, nullptr),
-    Flags({0, 0, 0}), DSOHandle(nullptr) {
+  : DeclContext(DeclContextKind::Module, nullptr),
+    TypeDecl(DeclKind::Module, &ctx, name, SourceLoc(), { }),
+    Flags() {
   ctx.addDestructorCleanup(*this);
   setImplicit();
   setInterfaceType(ModuleType::get(this));
-  setAccessibility(Accessibility::Public);
+
+  // validateDecl() should return immediately given a ModuleDecl.
+  setValidationToChecked();
+
+  setAccess(AccessLevel::Public);
 }
 
 void ModuleDecl::addFile(FileUnit &newFile) {
@@ -398,31 +409,11 @@ void ModuleDecl::lookupMember(SmallVectorImpl<ValueDecl*> &results,
   size_t oldSize = results.size();
   bool alreadyInPrivateContext = false;
 
-  switch (container->getContextKind()) {
-  case DeclContextKind::SerializedLocal:
-  case DeclContextKind::AbstractClosureExpr:
-  case DeclContextKind::Initializer:
-  case DeclContextKind::TopLevelCodeDecl:
-  case DeclContextKind::AbstractFunctionDecl:
-  case DeclContextKind::SubscriptDecl:
-    llvm_unreachable("This context does not support lookup.");
+  auto containerDecl = container->getAsDecl();
+  // If FileUnit, then use FileUnit::lookupValue instead.
+  assert(containerDecl != nullptr && "This context does not support lookup.");
 
-  case DeclContextKind::FileUnit:
-    llvm_unreachable("Use FileUnit::lookupValue instead.");
-
-  case DeclContextKind::ExtensionDecl:
-    llvm_unreachable("Use ExtensionDecl::lookupDirect instead.");
-
-  case DeclContextKind::Module: {
-    assert(container == this);
-    this->lookupValue({}, name, NLKind::QualifiedLookup, results);
-    break;
-  }
-
-  case DeclContextKind::GenericTypeDecl: {
-    auto nominal = dyn_cast<NominalTypeDecl>(container);
-    if (!nominal) break;
-
+  if (auto nominal = dyn_cast<NominalTypeDecl>(containerDecl)) {
     auto lookupResults = nominal->lookupDirect(name);
 
     // Filter out declarations from other modules.
@@ -435,9 +426,12 @@ void ModuleDecl::lookupMember(SmallVectorImpl<ValueDecl*> &results,
     auto AS = nominal->getFormalAccessScope();
     if (AS.isPrivate() || AS.isFileScope())
       alreadyInPrivateContext = true;
-
-    break;
-  }
+  } else if (isa<ModuleDecl>(containerDecl)) {
+    assert(container == this);
+    this->lookupValue({}, name, NLKind::QualifiedLookup, results);
+  } else if (!isa<GenericTypeDecl>(containerDecl)) {
+    // If ExtensionDecl, then use ExtensionDecl::lookupDirect instead.
+    llvm_unreachable("This context does not support lookup.");
   }
 
   // Filter by private-discriminator, or filter out private decls if there isn't
@@ -450,14 +444,14 @@ void ModuleDecl::lookupMember(SmallVectorImpl<ValueDecl*> &results,
   } else if (privateDiscriminator.empty()) {
     auto newEnd = std::remove_if(results.begin()+oldSize, results.end(),
                                  [](const ValueDecl *VD) -> bool {
-      return VD->getFormalAccess() <= Accessibility::FilePrivate;
+      return VD->getFormalAccess() <= AccessLevel::FilePrivate;
     });
     results.erase(newEnd, results.end());
 
   } else {
     auto newEnd = std::remove_if(results.begin()+oldSize, results.end(),
                                  [=](const ValueDecl *VD) -> bool {
-      if (VD->getFormalAccess() > Accessibility::FilePrivate)
+      if (VD->getFormalAccess() > AccessLevel::FilePrivate)
         return true;
       auto enclosingFile =
         cast<FileUnit>(VD->getDeclContext()->getModuleScopeContext());
@@ -477,7 +471,7 @@ void ModuleDecl::lookupObjCMethods(
 void BuiltinUnit::lookupValue(ModuleDecl::AccessPathTy accessPath, DeclName name,
                               NLKind lookupKind,
                               SmallVectorImpl<ValueDecl*> &result) const {
-  getCache().lookupValue(name.getBaseName(), lookupKind, *this, result);
+  getCache().lookupValue(name.getBaseIdentifier(), lookupKind, *this, result);
 }
 
 void BuiltinUnit::lookupObjCMethods(
@@ -557,8 +551,7 @@ void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results) const {
 }
 
 Optional<ProtocolConformanceRef>
-ModuleDecl::lookupConformance(Type type, ProtocolDecl *protocol,
-                              LazyResolver *resolver) {
+ModuleDecl::lookupConformance(Type type, ProtocolDecl *protocol) {
   ASTContext &ctx = getASTContext();
 
   // A dynamic Self type conforms to whatever its underlying type
@@ -577,20 +570,12 @@ ModuleDecl::lookupConformance(Type type, ProtocolDecl *protocol,
     // able to be resolved by a substitution that makes the archetype
     // concrete.
     if (auto super = archetype->getSuperclass()) {
-      if (auto inheritedConformance = lookupConformance(super, protocol,
-                                                        resolver)) {
+      if (auto inheritedConformance = lookupConformance(super, protocol)) {
         return ProtocolConformanceRef(
                  ctx.getInheritedConformance(
                    type,
                    inheritedConformance->getConcrete()));
       }
-    }
-
-    if (protocol->isSpecificProtocol(KnownProtocolKind::AnyObject)) {
-      if (archetype->requiresClass())
-        return ProtocolConformanceRef(protocol);
-
-      return None;
     }
 
     for (auto ap : archetype->getConformsTo()) {
@@ -605,35 +590,44 @@ ModuleDecl::lookupConformance(Type type, ProtocolDecl *protocol,
   // existential's list of conformances and the existential conforms to
   // itself.
   if (type->isExistentialType()) {
-    SmallVector<ProtocolDecl *, 4> protocols;
-    type->getAnyExistentialTypeProtocols(protocols);
+    // If the existential type cannot be represented or the protocol does not
+    // conform to itself, there's no point in looking further.
+    if (!protocol->existentialConformsToSelf())
+      return None;
+
+    auto layout = type->getExistentialLayout();
 
     // Due to an IRGen limitation, witness tables cannot be passed from an
     // existential to an archetype parameter, so for now we restrict this to
     // @objc protocols.
-    for (auto proto : protocols) {
-      if (!proto->isObjC() &&
-          !proto->isSpecificProtocol(KnownProtocolKind::AnyObject))
-        return None;
-    }
-
-    // If the existential type cannot be represented or the protocol does not
-    // conform to itself, there's no point in looking further.
-    if (!protocol->existentialConformsToSelf() ||
-        !protocol->existentialTypeSupported(resolver))
+    if (!layout.isObjC())
       return None;
 
-    // Special-case AnyObject, which may not be in the list of conformances.
-    if (protocol->isSpecificProtocol(KnownProtocolKind::AnyObject)) {
-      if (type->isClassExistentialType())
+    // If the existential is class-constrained, the class might conform
+    // concretely.
+    if (auto superclass = layout.explicitSuperclass) {
+      if (auto result = lookupConformance(superclass, protocol))
+        return result;
+    }
+
+    // Otherwise, the existential might conform abstractly.
+    for (auto proto : layout.getProtocols()) {
+      auto *protoDecl = proto->getDecl();
+
+      // If we found the protocol we're looking for, return an abstract
+      // conformance to it.
+      if (protoDecl == protocol)
         return ProtocolConformanceRef(protocol);
 
-      return None;
-    }
+      // If the protocol has a superclass constraint, we might conform
+      // concretely.
+      if (auto superclass = protoDecl->getSuperclass()) {
+        if (auto result = lookupConformance(superclass, protocol))
+          return result;
+      }
 
-    // Look for this protocol within the existential's list of conformances.
-    for (auto proto : protocols) {
-      if (proto == protocol || proto->inheritsFrom(protocol))
+      // Now check refined protocols.
+      if (protoDecl->inheritsFrom(protocol))
         return ProtocolConformanceRef(protocol);
     }
 
@@ -672,17 +666,14 @@ ModuleDecl::lookupConformance(Type type, ProtocolDecl *protocol,
   if (auto inherited = dyn_cast<InheritedProtocolConformance>(conformance)) {
     // Dig out the conforming nominal type.
     auto rootConformance = inherited->getRootNormalConformance();
-    auto conformingNominal
+    auto conformingClass
       = rootConformance->getType()->getClassOrBoundGenericClass();
 
     // Map up to our superclass's type.
-    Type superclassTy = type->getSuperclass(resolver);
-    while (superclassTy->getAnyNominal() != conformingNominal)
-      superclassTy = superclassTy->getSuperclass(resolver);
+    auto superclassTy = type->getSuperclassForDecl(conformingClass);
 
     // Compute the conformance for the inherited type.
-    auto inheritedConformance = lookupConformance(superclassTy, protocol,
-                                                  resolver);
+    auto inheritedConformance = lookupConformance(superclassTy, protocol);
     assert(inheritedConformance &&
            "We already found the inherited conformance");
 
@@ -773,6 +764,25 @@ public:
   }
 };
 
+struct SourceFile::SourceFileSyntaxInfo {
+  const bool Enable;
+  /// The root of the syntax tree representing the source file.
+  Optional<syntax::SourceFileSyntax> SyntaxRoot;
+  SourceFileSyntaxInfo(bool Enable): Enable(Enable) {}
+};
+
+bool SourceFile::hasSyntaxRoot() const {
+  return SyntaxInfo.SyntaxRoot.hasValue();
+}
+
+syntax::SourceFileSyntax SourceFile::getSyntaxRoot() const {
+  assert(hasSyntaxRoot() && "no syntax root is set.");
+  return *SyntaxInfo.SyntaxRoot;
+}
+
+void SourceFile::setSyntaxRoot(syntax::SourceFileSyntax &&Root) {
+  SyntaxInfo.SyntaxRoot.emplace(Root);
+}
 
 template<typename OP_DECL>
 static Optional<OP_DECL *>
@@ -833,8 +843,7 @@ lookupOperatorDeclForName(const FileUnit &File, SourceLoc Loc, Identifier Name,
 {
   switch (File.getKind()) {
   case FileUnitKind::Builtin:
-  case FileUnitKind::Derived:
-    // The Builtin module declares no operators, nor do derived units.
+    // The Builtin module declares no operators.
     return nullptr;
   case FileUnitKind::Source:
     break;
@@ -1125,24 +1134,19 @@ bool ModuleDecl::isSystemModule() const {
   return false;
 }
 
-template<bool respectVisibility, typename Callback>
-static bool forAllImportedModules(ModuleDecl *topLevel,
-                                  ModuleDecl::AccessPathTy thisPath,
-                                  bool includePrivateTopLevelImports,
-                                  const Callback &fn) {
+template<bool respectVisibility>
+static bool
+forAllImportedModules(ModuleDecl *topLevel, ModuleDecl::AccessPathTy thisPath,
+                      llvm::function_ref<bool(ModuleDecl::ImportedModule)> fn) {
   using ImportedModule = ModuleDecl::ImportedModule;
   using AccessPathTy = ModuleDecl::AccessPathTy;
   
   llvm::SmallSet<ImportedModule, 32, ModuleDecl::OrderImportedModules> visited;
   SmallVector<ImportedModule, 32> stack;
 
-  // Even if we're processing the top-level module like any other, we may
-  // still want to include non-exported modules.
-  ModuleDecl::ImportFilter filter = respectVisibility ? ModuleDecl::ImportFilter::Public
-                                                      : ModuleDecl::ImportFilter::All;
-  ModuleDecl::ImportFilter topLevelFilter =
-    includePrivateTopLevelImports ? ModuleDecl::ImportFilter::All : filter;
-  topLevel->getImportedModules(stack, topLevelFilter);
+  auto filter = respectVisibility ? ModuleDecl::ImportFilter::Public
+                                  : ModuleDecl::ImportFilter::All;
+  topLevel->getImportedModules(stack, filter);
 
   // Make sure the top-level module is first; we want pre-order-ish traversal.
   AccessPathTy overridingPath;
@@ -1180,11 +1184,10 @@ static bool forAllImportedModules(ModuleDecl *topLevel,
   return true;
 }
 
-bool ModuleDecl::forAllVisibleModules(AccessPathTy thisPath,
-                                      bool includePrivateTopLevelImports,
-                                  llvm::function_ref<bool(ImportedModule)> fn) {
-  return forAllImportedModules<true>(this, thisPath,
-                                     includePrivateTopLevelImports, fn);
+bool
+ModuleDecl::forAllVisibleModules(AccessPathTy thisPath,
+                                 llvm::function_ref<bool(ImportedModule)> fn) {
+  return forAllImportedModules<true>(this, thisPath, fn);
 }
 
 bool FileUnit::forAllVisibleModules(
@@ -1212,8 +1215,15 @@ void ModuleDecl::collectLinkLibraries(LinkLibraryCallback callback) {
 
 void
 SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {
-  for (auto importPair : Imports)
-    importPair.first.second->collectLinkLibraries(callback);
+  forAllImportedModules<false>(getParentModule(), /*thisPath*/{},
+                               [=](ModuleDecl::ImportedModule import) -> bool {
+    swift::ModuleDecl *next = import.second;
+    if (next->getName() == getParentModule()->getName())
+      return true;
+
+    next->collectLinkLibraries(callback);
+    return true;
+  });
 }
 
 bool ModuleDecl::walk(ASTWalker &Walker) {
@@ -1224,7 +1234,7 @@ bool ModuleDecl::walk(ASTWalker &Walker) {
   return false;
 }
 
-const clang::Module *ModuleDecl::findUnderlyingClangModule() {
+const clang::Module *ModuleDecl::findUnderlyingClangModule() const {
   for (auto *FU : getFiles()) {
     if (auto *Mod = FU->getUnderlyingClangModule())
       return Mod;
@@ -1301,15 +1311,17 @@ SourceFile::getCachedVisibleDecls() const {
   return getCache().AllVisibleValues;
 }
 
-static void performAutoImport(SourceFile &SF,
-                              SourceFile::ImplicitModuleImportKind modImpKind) {
+static void performAutoImport(
+    SourceFile &SF,
+    SourceFile::ImplicitModuleImportKind implicitModuleImportKind) {
   if (SF.Kind == SourceFileKind::SIL)
-    assert(modImpKind == SourceFile::ImplicitModuleImportKind::None);
+    assert(implicitModuleImportKind ==
+           SourceFile::ImplicitModuleImportKind::None);
 
   ASTContext &Ctx = SF.getASTContext();
   ModuleDecl *M = nullptr;
 
-  switch (modImpKind) {
+  switch (implicitModuleImportKind) {
   case SourceFile::ImplicitModuleImportKind::None:
     return;
   case SourceFile::ImplicitModuleImportKind::Builtin:
@@ -1331,9 +1343,11 @@ static void performAutoImport(SourceFile &SF,
 
 SourceFile::SourceFile(ModuleDecl &M, SourceFileKind K,
                        Optional<unsigned> bufferID,
-                       ImplicitModuleImportKind ModImpKind)
+                       ImplicitModuleImportKind ModImpKind,
+                       bool KeepParsedTokens, bool BuildSyntaxTree)
   : FileUnit(FileUnitKind::Source, M),
-    BufferID(bufferID ? *bufferID : -1), Kind(K) {
+    BufferID(bufferID ? *bufferID : -1),
+    Kind(K), SyntaxInfo(*new SourceFileSyntaxInfo(BuildSyntaxTree)) {
   M.getASTContext().addDestructorCleanup(*this);
   performAutoImport(*this, ModImpKind);
 
@@ -1342,9 +1356,46 @@ SourceFile::SourceFile(ModuleDecl &M, SourceFileKind K,
     assert(!problem && "multiple main files?");
     (void)problem;
   }
+  if (KeepParsedTokens) {
+    AllCorrectedTokens = std::vector<Token>();
+  }
 }
 
-SourceFile::~SourceFile() {}
+SourceFile::~SourceFile() { delete &SyntaxInfo; }
+
+std::vector<Token> &SourceFile::getTokenVector() {
+  assert(shouldCollectToken() && "Disabled");
+  return *AllCorrectedTokens;
+}
+
+ArrayRef<Token> SourceFile::getAllTokens() const {
+  assert(shouldCollectToken() && "Disabled");
+  return *AllCorrectedTokens;
+}
+
+bool SourceFile::shouldCollectToken() const {
+  switch (Kind) {
+  case SourceFileKind::Library:
+  case SourceFileKind::Main:
+  case SourceFileKind::Interface:
+    return (bool)AllCorrectedTokens;
+  case SourceFileKind::REPL:
+  case SourceFileKind::SIL:
+    return false;
+  }
+}
+
+bool SourceFile::shouldBuildSyntaxTree() const {
+  switch (Kind) {
+  case SourceFileKind::Library:
+  case SourceFileKind::Main:
+  case SourceFileKind::Interface:
+    return SyntaxInfo.Enable;
+  case SourceFileKind::REPL:
+  case SourceFileKind::SIL:
+    return false;
+  }
+}
 
 bool FileUnit::walk(ASTWalker &walker) {
   SmallVector<Decl *, 64> Decls;
@@ -1435,6 +1486,11 @@ TypeRefinementContext *SourceFile::getTypeRefinementContext() {
 
 void SourceFile::setTypeRefinementContext(TypeRefinementContext *Root) {
   TRC = Root;
+}
+
+void SourceFile::createReferencedNameTracker() {
+  assert(!ReferencedNames && "This file already has a name tracker.");
+  ReferencedNames.emplace(ReferencedNameTracker());
 }
 
 //===----------------------------------------------------------------------===//

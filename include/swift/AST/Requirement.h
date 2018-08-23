@@ -98,15 +98,14 @@ public:
       return None;
 
     switch (getKind()) {
+    case RequirementKind::Conformance:
+    case RequirementKind::Superclass:
     case RequirementKind::SameType: {
       auto newSecond = getSecondType().subst(std::forward<Args>(args)...);
       if (!newSecond)
         return None;
       return Requirement(getKind(), newFirst, newSecond);
     }
-    case RequirementKind::Conformance:
-    case RequirementKind::Superclass:
-      return Requirement(getKind(), newFirst, getSecondType());
     case RequirementKind::Layout:
       return Requirement(getKind(), newFirst, getLayoutConstraint());
     }
@@ -121,6 +120,7 @@ public:
   }
 
   void dump() const;
+  void dump(raw_ostream &out) const;
   void print(raw_ostream &os, const PrintOptions &opts) const;
   void print(ASTPrinter &printer, const PrintOptions &opts) const;
 };

@@ -35,7 +35,18 @@ class Traversal : public TypeVisitor<Traversal, bool>
   bool visitErrorType(ErrorType *ty) { return false; }
   bool visitUnresolvedType(UnresolvedType *ty) { return false; }
   bool visitBuiltinType(BuiltinType *ty) { return false; }
-  bool visitNameAliasType(NameAliasType *ty) { return false; }
+  bool visitNameAliasType(NameAliasType *ty) {
+    if (auto parent = ty->getParent())
+      if (doIt(parent)) return true;
+
+    for (auto arg : ty->getInnermostGenericArgs())
+      if (doIt(arg))
+        return true;
+    
+    return false;
+
+  }
+  bool visitSILTokenType(SILTokenType *ty) { return false; }
 
   bool visitParenType(ParenType *ty) {
     return doIt(ty->getUnderlyingType());
@@ -73,8 +84,11 @@ class Traversal : public TypeVisitor<Traversal, bool>
   }
 
   bool visitAnyFunctionType(AnyFunctionType *ty) {
-    if (doIt(ty->getInput()))
-      return true;
+    for (const auto &param : ty->getParams()) {
+      if (doIt(param.getType()))
+        return true;
+    }
+
     return doIt(ty->getResult());
   }
 
@@ -90,10 +104,11 @@ class Traversal : public TypeVisitor<Traversal, bool>
       switch (req.getKind()) {
       case RequirementKind::SameType:
       case RequirementKind::Conformance:
-      case RequirementKind::Layout:
       case RequirementKind::Superclass:
         if (doIt(req.getSecondType()))
           return true;
+        break;
+      case RequirementKind::Layout:
         break;
       }
     }
@@ -114,7 +129,7 @@ class Traversal : public TypeVisitor<Traversal, bool>
     return false;
   }
 
-  bool visitSyntaxSugarType(SyntaxSugarType *ty) {
+  bool visitUnarySyntaxSugarType(UnarySyntaxSugarType *ty) {
     return doIt(ty->getBaseType());
   }
 
@@ -123,8 +138,8 @@ class Traversal : public TypeVisitor<Traversal, bool>
   }
 
   bool visitProtocolCompositionType(ProtocolCompositionType *ty) {
-    for (auto proto : ty->getProtocols())
-      if (doIt(proto))
+    for (auto member : ty->getMembers())
+      if (doIt(member))
         return true;
     return false;
   }
@@ -158,14 +173,12 @@ class Traversal : public TypeVisitor<Traversal, bool>
   bool visitTypeVariableType(TypeVariableType *ty) { return false; }
   
   bool visitSILBlockStorageType(SILBlockStorageType *ty) {
-    if (doIt(ty->getCaptureType()))
-      return true;
-    return false;
+    return doIt(ty->getCaptureType());
   }
 
   bool visitSILBoxType(SILBoxType *ty) {
-    for (auto &arg : ty->getGenericArgs()) {
-      if (doIt(arg.getReplacement()))
+    for (Type type : ty->getSubstitutions().getReplacementTypes()) {
+      if (type && doIt(type))
         return true;
     }
     return false;

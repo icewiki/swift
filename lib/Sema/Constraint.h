@@ -18,6 +18,7 @@
 #ifndef SWIFT_SEMA_CONSTRAINT_H
 #define SWIFT_SEMA_CONSTRAINT_H
 
+#include "CSFix.h"
 #include "OverloadChoice.h"
 #include "swift/AST/FunctionRefKind.h"
 #include "swift/AST/Identifier.h"
@@ -82,9 +83,6 @@ enum class ConstraintKind : char {
   /// \brief The first type must conform to the second type (which is a
   /// protocol type).
   ConformsTo,
-  /// \brief The first type must conform to the layout defined by the second
-  /// component representing a layout constraint.
-  Layout,
   /// \brief The first type describes a literal that conforms to the second
   /// type, which is one of the known expressible-by-literal protocols.
   LiteralConformsTo,
@@ -132,6 +130,16 @@ enum class ConstraintKind : char {
   /// \brief The first type is an opened type from the second type (which is
   /// an existential).
   OpenedExistentialOf,
+  /// \brief A relation between three types. The first is the key path type,
+  // the second is the root type, and the third is the projected value type.
+  // The second and third types can be lvalues depending on the kind of key
+  // path.
+  KeyPathApplication,
+  /// \brief A relation between three types. The first is the key path type,
+  // the second is its root type, and the third is the projected value type.
+  // The key path type is chosen based on the selection of overloads for the
+  // member references along the path.
+  KeyPath,
 };
 
 /// \brief Classification of the different kinds of constraints.
@@ -161,8 +169,6 @@ enum class ConstraintClassification : char {
 enum class ConversionRestrictionKind {
   /// Tuple-to-tuple conversion.
   TupleToTuple,
-  /// Scalar-to-tuple conversion.
-  ScalarToTuple,
   /// Deep equality comparison.
   DeepEquality,
   /// Subclass-to-superclass conversion.
@@ -187,12 +193,12 @@ enum class ConversionRestrictionKind {
   Existential,
   /// Metatype to existential metatype conversion.
   MetatypeToExistentialMetatype,
+  /// Existential metatype to metatype conversion.
+  ExistentialMetatypeToMetatype,
   /// T -> U? value to optional conversion (or to implicitly unwrapped optional).
   ValueToOptional,
   /// T? -> U? optional to optional conversion (or unchecked to unchecked).
   OptionalToOptional,
-  /// Implicit forces of implicitly unwrapped optionals to their presumed values
-  ForceUnchecked,
   /// Implicit upcast conversion of array types.
   ArrayUpcast,
   /// Implicit upcast conversion of dictionary types, which includes
@@ -220,67 +226,6 @@ enum RememberChoice_t : bool {
   RememberChoice = true
 };
 
-/// Describes the kind of fix to apply to the given constraint before
-/// visiting it.
-enum class FixKind : uint8_t {
-  /// No fix, which is used as a placeholder indicating that future processing
-  /// of this constraint should not attempt fixes.
-  None,
-
-  /// Introduce a '!' to force an optional unwrap.
-  ForceOptional,
-    
-  /// Introduce a '?.' to begin optional chaining.
-  OptionalChaining,
-
-  /// Append 'as! T' to force a downcast to the specified type.
-  ForceDowncast,
-
-  /// Introduce a '&' to take the address of an lvalue.
-  AddressOf,
-  
-  /// Replace a coercion ('as') with a forced checked cast ('as!').
-  CoerceToCheckedCast,
-};
-
-/// Describes a fix that can be applied to a constraint before visiting it.
-class Fix {
-  FixKind Kind;
-  uint16_t Data;
-
-  Fix(FixKind kind, uint16_t data) : Kind(kind), Data(data){ }
-
-  uint16_t getData() const { return Data; }
-
-  friend class Constraint;
-
-public:
-  Fix() : Kind(FixKind::None), Data(0) { }
-  
-  Fix(FixKind kind) : Kind(kind), Data(0) { 
-    assert(kind != FixKind::ForceDowncast && "Use getForceDowncast()");
-  }
-
-  /// Produce a new fix that performs a forced downcast to the given type.
-  static Fix getForcedDowncast(ConstraintSystem &cs, Type toType);
-
-  /// Retrieve the kind of fix.
-  FixKind getKind() const { return Kind; }
-
-  /// If this fix has a type argument, retrieve it.
-  Type getTypeArgument(ConstraintSystem &cs) const;
-
-  /// Return a string representation of a fix.
-  static llvm::StringRef getName(FixKind kind);
-
-  void print(llvm::raw_ostream &Out, ConstraintSystem *cs) const;
-
-  LLVM_ATTRIBUTE_DEPRECATED(void dump(ConstraintSystem *cs) const 
-                              LLVM_ATTRIBUTE_USED,
-                            "only for use within the debugger");
-};
-
-
 /// \brief A constraint between two type variables.
 class Constraint final : public llvm::ilist_node<Constraint>,
     private llvm::TrailingObjects<Constraint, TypeVariableType *> {
@@ -292,20 +237,18 @@ class Constraint final : public llvm::ilist_node<Constraint>,
   /// The kind of restriction placed on this constraint.
   ConversionRestrictionKind Restriction : 8;
 
-  /// Data associated with the fix.
-  uint16_t FixData;
-
-  /// The kind of fix to be applied to the constraint before visiting it.
-  FixKind TheFix;
+  /// The fix to be applied to the constraint before visiting it.
+  ConstraintFix *TheFix = nullptr;
 
   /// Whether the \c Restriction field is valid.
   unsigned HasRestriction : 1;
 
-  /// Whether the \c Fix field is valid.
-  unsigned HasFix : 1;
-
   /// Whether this constraint is currently active, i.e., stored in the worklist.
   unsigned IsActive : 1;
+
+  /// Was this constraint was determined to be inconsistent with the
+  /// constraint graph during constraint propagation?
+  unsigned IsDisabled : 1;
 
   /// Whether the choice of this disjunction should be recorded in the
   /// solver state.
@@ -331,6 +274,9 @@ class Constraint final : public llvm::ilist_node<Constraint>,
 
       /// \brief The second type.
       Type Second;
+
+      /// \brief The third type, if any.
+      Type Third;
     } Types;
 
     struct {
@@ -379,6 +325,11 @@ class Constraint final : public llvm::ilist_node<Constraint>,
              ConstraintLocator *locator,
              ArrayRef<TypeVariableType *> typeVars);
 
+  /// Construct a new constraint.
+  Constraint(ConstraintKind kind, Type first, Type second, Type third,
+             ConstraintLocator *locator,
+             ArrayRef<TypeVariableType *> typeVars);
+
   /// Construct a new member constraint.
   Constraint(ConstraintKind kind, Type first, Type second, DeclName member,
              DeclContext *useDC, FunctionRefKind functionRefKind,
@@ -395,9 +346,8 @@ class Constraint final : public llvm::ilist_node<Constraint>,
              ArrayRef<TypeVariableType *> typeVars);
   
   /// Construct a relational constraint with a fix.
-  Constraint(ConstraintKind kind, Fix fix,
-             Type first, Type second, ConstraintLocator *locator,
-             ArrayRef<TypeVariableType *> typeVars);
+  Constraint(ConstraintKind kind, ConstraintFix *fix, Type first, Type second,
+             ConstraintLocator *locator, ArrayRef<TypeVariableType *> typeVars);
 
   /// Retrieve the type variables buffer, for internal mutation.
   MutableArrayRef<TypeVariableType *> getTypeVariablesBuffer() {
@@ -409,6 +359,18 @@ public:
   static Constraint *create(ConstraintSystem &cs, ConstraintKind Kind, 
                             Type First, Type Second,
                             ConstraintLocator *locator);
+
+  /// Create a new constraint.
+  static Constraint *create(ConstraintSystem &cs, ConstraintKind Kind, 
+                            Type First, Type Second, Type Third,
+                            ConstraintLocator *locator);
+
+  /// Create a new member constraint, or a disjunction of that with the outer
+  /// alternatives.
+  static Constraint *createMemberOrOuterDisjunction(
+      ConstraintSystem &cs, ConstraintKind kind, Type first, Type second,
+      DeclName member, DeclContext *useDC, FunctionRefKind functionRefKind,
+      ArrayRef<OverloadChoice> outerAlternatives, ConstraintLocator *locator);
 
   /// Create a new member constraint.
   static Constraint *createMember(ConstraintSystem &cs, ConstraintKind kind,
@@ -431,8 +393,7 @@ public:
 
   /// Create a relational constraint with a fix.
   static Constraint *createFixed(ConstraintSystem &cs, ConstraintKind kind,
-                                 Fix fix,
-                                 Type first, Type second,
+                                 ConstraintFix *fix, Type first, Type second,
                                  ConstraintLocator *locator);
 
   /// Create a new disjunction constraint.
@@ -454,19 +415,31 @@ public:
   }
 
   /// Retrieve the fix associated with this constraint.
-  Optional<Fix> getFix() const {
-    if (!HasFix)
-      return None;
-
-    return Fix(TheFix, FixData);
-  }
+  ConstraintFix *getFix() const { return TheFix; }
 
   /// Whether this constraint is active, i.e., in the worklist.
   bool isActive() const { return IsActive; }
 
   /// Set whether this constraint is active or not.
-  void setActive(bool active) { IsActive = active; }
-  
+  void setActive(bool active) {
+    assert(!isDisabled() && "Cannot activate a constraint that is disabled!");
+    IsActive = active;
+  }
+
+  /// Whether this constraint is active, i.e., in the worklist.
+  bool isDisabled() const { return IsDisabled; }
+
+  /// Set whether this constraint is active or not.
+  void setDisabled() {
+    assert(!isActive() && "Cannot disable constraint marked as active!");
+    IsDisabled = true;
+  }
+
+  void setEnabled() {
+    assert(isDisabled() && "Can't re-enable already active constraint!");
+    IsDisabled = false;
+  }
+
   /// Mark or retrieve whether this constraint should be favored in the system.
   void setFavored() { IsFavored = true; }
   bool isFavored() const { return IsFavored; }
@@ -496,7 +469,6 @@ public:
     case ConstraintKind::OperatorArgumentTupleConversion:
     case ConstraintKind::OperatorArgumentConversion:
     case ConstraintKind::ConformsTo:
-    case ConstraintKind::Layout:
     case ConstraintKind::LiteralConformsTo:
     case ConstraintKind::CheckedCast:
     case ConstraintKind::SelfObjectOfProtocol:
@@ -512,6 +484,8 @@ public:
     case ConstraintKind::DynamicTypeOf:
     case ConstraintKind::EscapableFunctionOf:
     case ConstraintKind::OpenedExistentialOf:
+    case ConstraintKind::KeyPath:
+    case ConstraintKind::KeyPathApplication:
     case ConstraintKind::Defaultable:
       return ConstraintClassification::TypeProperty;
 
@@ -556,6 +530,17 @@ public:
     }
   }
 
+  /// \brief Retrieve the third type in the constraint.
+  Type getThirdType() const {
+    switch (getKind()) {
+    case ConstraintKind::KeyPath:
+    case ConstraintKind::KeyPathApplication:
+      return Types.Third;
+    default:
+      llvm_unreachable("no third type");
+    }
+  }
+
   /// \brief Retrieve the protocol in a conformance constraint.
   ProtocolDecl *getProtocol() const;
 
@@ -586,6 +571,15 @@ public:
   ArrayRef<Constraint *> getNestedConstraints() const {
     assert(Kind == ConstraintKind::Disjunction);
     return Nested;
+  }
+
+  unsigned countActiveNestedConstraints() const {
+    unsigned count = 0;
+    for (auto *constraint : Nested)
+      if (!constraint->isDisabled())
+        count++;
+
+    return count;
   }
 
   /// Retrieve the overload choice for an overload-binding constraint.
@@ -640,8 +634,8 @@ namespace llvm {
 /// Specialization of \c ilist_traits for constraints.
 template<>
 struct ilist_traits<swift::constraints::Constraint>
-         : public ilist_default_traits<swift::constraints::Constraint> {
-  typedef swift::constraints::Constraint Element;
+         : public ilist_node_traits<swift::constraints::Constraint> {
+  using Element = swift::constraints::Constraint;
 
   static Element *createNode(const Element &V) = delete;
   static void deleteNode(Element *V) { /* never deleted */ }

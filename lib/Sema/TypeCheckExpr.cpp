@@ -65,7 +65,7 @@ static void substituteInputSugarArgumentType(Type argTy, CanType resultTy,
   
   // Make sure this argument's sugar is consistent with the sugar we
   // already found.
-  if (argTy->isSpelledLike(resultSugarTy))
+  if (argTy.getPointer() == resultSugarTy.getPointer())
     return;
   uniqueSugarTy = false;
 }
@@ -102,7 +102,7 @@ Expr *TypeChecker::substituteInputSugarTypeForResult(ApplyExpr *E) {
     // constructed.  Apply the sugar onto it.
     if (auto FT = E->getType()->getAs<FunctionType>())
       if (FT->getResult()->isEqual(resultSugar) && !resultSugar->isCanonical()){
-        auto NFT = FunctionType::get(FT->getInput(), resultSugar,
+        auto NFT = FunctionType::get(FT->getParams(), resultSugar,
                                      FT->getExtInfo());
         E->setType(NFT);
         return E;
@@ -167,13 +167,13 @@ TypeChecker::lookupPrecedenceGroupForInfixOperator(DeclContext *DC, Expr *E) {
                                      castExpr->getAsLoc());
   }
 
-  if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
-    Identifier name = DRE->getDecl()->getName();
+  if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    Identifier name = DRE->getDecl()->getBaseName().getIdentifier();
     return lookupPrecedenceGroupForOperator(*this, DC, name, DRE->getLoc());
   }
 
-  if (OverloadedDeclRefExpr *OO = dyn_cast<OverloadedDeclRefExpr>(E)) {
-    Identifier name = OO->getDecls()[0]->getName();
+  if (auto *OO = dyn_cast<OverloadedDeclRefExpr>(E)) {
+    Identifier name = OO->getDecls()[0]->getBaseName().getIdentifier();
     return lookupPrecedenceGroupForOperator(*this, DC, name, OO->getLoc());
   }
 
@@ -207,7 +207,7 @@ static Expr *makeBinOp(TypeChecker &TC, Expr *Op, Expr *LHS, Expr *RHS,
     return nullptr;
 
   // If the left-hand-side is a 'try', hoist it up.
-  AnyTryExpr *tryEval = dyn_cast<AnyTryExpr>(LHS);
+  auto *tryEval = dyn_cast<AnyTryExpr>(LHS);
   if (tryEval) {
     LHS = tryEval->getSubExpr();
   }
@@ -492,23 +492,6 @@ static Expr *foldSequence(TypeChecker &TC, DeclContext *DC,
   return makeBinOp(TC, op1.op, LHS, RHS, op1.precedence, S.empty());
 }
 
-Type TypeChecker::getTypeOfRValue(ValueDecl *value, bool wantInterfaceType) {
-
-  Type type;
-  if (wantInterfaceType) {
-    if (!value->hasInterfaceType())
-      validateDecl(value);
-    type = value->getInterfaceType();
-  } else {
-    auto *var = cast<VarDecl>(value);
-    if (!var->hasType())
-      validateDecl(var);
-    type = var->getType();
-  }
-
-  return type->getLValueOrInOutObjectType()->getReferenceStorageReferent();
-}
-
 bool TypeChecker::requireOptionalIntrinsics(SourceLoc loc) {
   if (Context.hasOptionalIntrinsics(this)) return false;
 
@@ -530,119 +513,27 @@ bool TypeChecker::requireArrayLiteralIntrinsics(SourceLoc loc) {
   return true;
 }
 
-/// Does a var or subscript produce an l-value?
-///
-/// \param baseType - the type of the base on which this object
-///   is being accessed; must be null if and only if this is not
-///   a type member
-static bool doesStorageProduceLValue(TypeChecker &TC,
-                                     AbstractStorageDecl *storage,
-                                     Type baseType, DeclContext *useDC,
-                                     const DeclRefExpr *base = nullptr) {
-  // Unsettable storage decls always produce rvalues.
-  if (!storage->isSettable(useDC, base))
-    return false;
-  
-  if (TC.Context.LangOpts.EnableAccessControl &&
-      !storage->isSetterAccessibleFrom(useDC))
-    return false;
-
-  // If there is no base, or if the base isn't being used, it is settable.
-  // This is only possible for vars.
-  if (auto var = dyn_cast<VarDecl>(storage)) {
-    if (!baseType || var->isStatic())
-      return true;
-  }
-
-  // If the base is an lvalue, then a reference produces an lvalue.
-  if (baseType->is<LValueType>())
-    return true;
-
-  // Stored properties of reference types produce lvalues.
-  if (baseType->hasReferenceSemantics() && storage->hasStorage())
-    return true;
-
-  // So the base is an rvalue type. The only way an accessor can
-  // produce an lvalue is if we have a property where both the
-  // getter and setter are nonmutating.
-  return !storage->hasStorage() &&
-      !storage->isGetterMutating() &&
-      storage->isSetterNonMutating();
-}
-
-Type TypeChecker::getUnopenedTypeOfReference(ValueDecl *value, Type baseType,
-                                             DeclContext *UseDC,
-                                             const DeclRefExpr *base,
-                                             bool wantInterfaceType) {
-  validateDecl(value);
-  if (value->isInvalid())
-    return ErrorType::get(Context);
-
-  Type requestedType = getTypeOfRValue(value, wantInterfaceType);
-
-  // If we're dealing with contextual types, and we referenced this type from
-  // a different context, map the type.
-  if (!wantInterfaceType && requestedType->hasArchetype()) {
-    auto valueDC = value->getDeclContext();
-    if (valueDC != UseDC) {
-      Type mapped = valueDC->mapTypeOutOfContext(requestedType);
-      requestedType = UseDC->mapTypeIntoContext(mapped);
-    }
-  }
-
-  // Qualify storage declarations with an lvalue when appropriate.
-  // Otherwise, they yield rvalues (and the access must be a load).
-  if (auto *storage = dyn_cast<AbstractStorageDecl>(value)) {
-    if (doesStorageProduceLValue(*this, storage, baseType, UseDC, base)) {
-      // Vars are simply lvalues of their rvalue type.
-      if (isa<VarDecl>(storage))
-        return LValueType::get(requestedType);
-
-      // Subscript decls have function type.  For the purposes of later type
-      // checker consumption, model this as returning an lvalue.
-      assert(isa<SubscriptDecl>(storage));
-      auto *RFT = requestedType->castTo<AnyFunctionType>();
-      return FunctionType::get(RFT->getInput(),
-                               LValueType::get(RFT->getResult()),
-                               RFT->getExtInfo());
-    }
-
-    // FIXME: Fix downstream callers.
-    if (auto *genericFn = requestedType->getAs<GenericFunctionType>()) {
-      return FunctionType::get(genericFn->getInput(),
-                               genericFn->getResult(),
-                               genericFn->getExtInfo());
-    }
-  }
-
-  return requestedType;
-}
-
-Expr *TypeChecker::buildCheckedRefExpr(ValueDecl *value, DeclContext *UseDC,
+Expr *TypeChecker::buildCheckedRefExpr(VarDecl *value, DeclContext *UseDC,
                                        DeclNameLoc loc, bool Implicit) {
   auto type = getUnopenedTypeOfReference(value, Type(), UseDC);
-  AccessSemantics semantics = value->getAccessSemanticsFromContext(UseDC);
+  auto semantics = value->getAccessSemanticsFromContext(UseDC,
+                                                       /*isAccessOnSelf*/false);
   return new (Context) DeclRefExpr(value, loc, Implicit, semantics, type);
 }
 
 Expr *TypeChecker::buildRefExpr(ArrayRef<ValueDecl *> Decls,
                                 DeclContext *UseDC, DeclNameLoc NameLoc,
-                                bool Implicit, bool isSpecialized,
-                                FunctionRefKind functionRefKind) {
+                                bool Implicit, FunctionRefKind functionRefKind) {
   assert(!Decls.empty() && "Must have at least one declaration");
 
   if (Decls.size() == 1 && !isa<ProtocolDecl>(Decls[0]->getDeclContext())) {
-    AccessSemantics semantics = Decls[0]->getAccessSemanticsFromContext(UseDC);
-    auto result = new (Context) DeclRefExpr(Decls[0], NameLoc, Implicit,
-                                            semantics);
-    if (isSpecialized)
-      result->setSpecialized();
-    return result;
+    auto semantics = Decls[0]->getAccessSemanticsFromContext(UseDC,
+                                                       /*isAccessOnSelf*/false);
+    return new (Context) DeclRefExpr(Decls[0], NameLoc, Implicit, semantics);
   }
 
   Decls = Context.AllocateCopy(Decls);
   auto result = new (Context) OverloadedDeclRefExpr(Decls, NameLoc, 
-                                                    isSpecialized,
                                                     functionRefKind,
                                                     Implicit);
   return result;
@@ -769,8 +660,9 @@ Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
     // Strip off one level of sugar; we don't actually want to print
     // the name of the typealias itself anywhere.
     if (type && *type) {
-      if (auto typeAlias = dyn_cast<NameAliasType>(type->getPointer()))
-        *type = typeAlias->getSinglyDesugaredType();
+      if (auto boundTypeAlias =
+                 dyn_cast<NameAliasType>(type->getPointer()))
+        *type = boundTypeAlias->getSinglyDesugaredType();
     }
   }
 

@@ -22,24 +22,7 @@ public class NSSimpleCString {}
 @available(*, unavailable, message: "Please use String or NSString")
 public class NSConstantString {}
 
-@_silgen_name("swift_convertStringToNSString")
-public // COMPILER_INTRINSIC
-func _convertStringToNSString(_ string: String) -> NSString {
-  return string._bridgeToObjectiveC()
-}
-
 extension NSString : ExpressibleByStringLiteral {
-  /// Create an instance initialized to `value`.
-  public required convenience init(unicodeScalarLiteral value: StaticString) {
-    self.init(stringLiteral: value)
-  }
-
-  public required convenience init(
-    extendedGraphemeClusterLiteral value: StaticString
-  ) {
-    self.init(stringLiteral: value)
-  }
-
   /// Create an instance initialized to `value`.
   public required convenience init(stringLiteral value: StaticString) {
     var immutableResult: NSString
@@ -124,7 +107,8 @@ extension NSString {
   }
 }
 
-extension NSString : CustomPlaygroundQuickLookable {
+extension NSString : _CustomPlaygroundQuickLookable {
+  @available(*, deprecated, message: "NSString.customPlaygroundQuickLook will be removed in a future Swift version")
   public var customPlaygroundQuickLook: PlaygroundQuickLook {
     return .text(self as String)
   }

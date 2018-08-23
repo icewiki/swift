@@ -11,7 +11,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTScope.h"
 #include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/Module.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
 
@@ -44,7 +46,7 @@ class TestContext : public TestContextBase {
   SourceFile *FileForLookups;
 
 public:
-  ASTContext Ctx;
+  ASTContext &Ctx;
 
   TestContext(ShouldDeclareOptionalTypes optionals = DoNotDeclareOptionalTypes);
 
@@ -54,7 +56,7 @@ public:
     auto result = new (Ctx) Nominal(SourceLoc(), Ctx.getIdentifier(name),
                                     SourceLoc(), /*inherited*/{},
                                     genericParams, FileForLookups);
-    result->setAccessibility(Accessibility::Internal);
+    result->setAccess(AccessLevel::Internal);
     return result;
   }
 };

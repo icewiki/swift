@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift
+// RUN: %target-run-simple-swift-swift3
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
 
@@ -7,6 +7,7 @@ import StdlibCollectionUnittest
 import Foundation
 
 var DataTestSuite = TestSuite("Data")
+
 DataTestSuite.test("Data.Iterator semantics") {
   // Empty data
   checkSequence([], Data())
@@ -37,7 +38,6 @@ DataTestSuite.test("associated types") {
     iteratorType: Data.Iterator.self,
     subSequenceType: Subject.self,
     indexType: Int.self,
-    indexDistanceType: Int.self,
     indicesType: CountableRange<Int>.self)
 }
 
@@ -55,6 +55,8 @@ DataTestSuite.test("Data SubSequence") {
         expectEqual(dataSlice.startIndex, i)
         expectEqual(dataSlice.endIndex, j)
         
+        expectEqual(dataSlice[i], arraySlice[i])
+
         dataSlice[i] = 0xFF
         
         expectEqual(dataSlice.startIndex, i)

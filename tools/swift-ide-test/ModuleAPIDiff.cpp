@@ -12,6 +12,7 @@
 
 #include "ModuleAPIDiff.h"
 #include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Driver/FrontendUtil.h"
@@ -83,10 +84,9 @@ generic-signature ::=
     GenericSignature:
         GenericParams:                  (ordered)
             - Name: <identifier>
-              (Superclass: <type-name>)?
         ConformanceRequirements:
             - Type: <type-name>
-              Protocol: <type-name>
+              ProtocolOrClass: <type-name>
         SameTypeRequirements:
             - FirstType: <type-name>
               SecondType: <type-name>
@@ -233,7 +233,7 @@ decl-attributes ::=
       return ScalarTraits<std::string>::input(Scalar, Context,                 \
                                               Val.STRING_MEMBER_NAME);         \
     }                                                                          \
-    static bool mustQuote(StringRef S) {                                       \
+    static QuotingType mustQuote(StringRef S) {                                \
       return ScalarTraits<std::string>::mustQuote(S);                          \
     }                                                                          \
   };                                                                           \
@@ -320,7 +320,6 @@ bool operator==(const NestedDecls &LHS, const NestedDecls &RHS) {
 
 struct GenericParam {
   Identifier Name;
-  Optional<TypeName> Superclass;
 };
 
 struct ConformanceRequirement {
@@ -507,7 +506,6 @@ template <> struct MappingTraits<::swift::sma::NestedDecls> {
 template <> struct MappingTraits<::swift::sma::GenericParam> {
   static void mapping(IO &io, ::swift::sma::GenericParam &ND) {
     io.mapRequired("Name", ND.Name);
-    io.mapOptional("Superclass", ND.Superclass);
   }
 };
 
@@ -745,20 +743,20 @@ public:
     for (auto *GTPT : GS->getGenericParams()) {
       sma::GenericParam ResultGP;
       ResultGP.Name = convertToIdentifier(GTPT->getName());
-      if (auto SuperclassTy = GTPT->getSuperclass(nullptr)) {
-        ResultGP.Superclass = convertToTypeName(SuperclassTy);
-      }
       ResultGS.GenericParams.emplace_back(std::move(ResultGP));
     }
     for (auto &Req : GS->getRequirements()) {
       switch (Req.getKind()) {
       case RequirementKind::Superclass:
       case RequirementKind::Conformance:
-      case RequirementKind::Layout:
         ResultGS.ConformanceRequirements.emplace_back(
             sma::ConformanceRequirement{
                 convertToTypeName(Req.getFirstType()),
                 convertToTypeName(Req.getSecondType())});
+        break;
+      case RequirementKind::Layout:
+        // FIXME
+        assert(false && "Not implemented");
         break;
       case RequirementKind::SameType:
         ResultGS.SameTypeRequirements.emplace_back(

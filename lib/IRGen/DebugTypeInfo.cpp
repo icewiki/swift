@@ -17,7 +17,6 @@
 
 #include "DebugTypeInfo.h"
 #include "FixedTypeInfo.h"
-#include "IRGen.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -27,13 +26,21 @@ using namespace irgen;
 
 DebugTypeInfo::DebugTypeInfo(DeclContext *DC, GenericEnvironment *GE,
                              swift::Type Ty, llvm::Type *StorageTy, Size size,
-                             Alignment align)
+                             Alignment align, bool HasDefaultAlignment)
     : DeclCtx(DC), GenericEnv(GE), Type(Ty.getPointer()),
-      StorageType(StorageTy), size(size), align(align) {
-  assert((!isArchetype() || (isArchetype() && DC)) &&
-         "archetype without a declcontext");
+      StorageType(StorageTy), size(size), align(align),
+      DefaultAlignment(HasDefaultAlignment) {
   assert(StorageType && "StorageType is a nullptr");
   assert(align.getValue() != 0);
+}
+
+/// Determine whether this type has a custom @_alignment attribute.
+static bool hasDefaultAlignment(swift::Type Ty) {
+  if (auto CanTy = Ty->getCanonicalType())
+    if (auto *TyDecl = CanTy.getNominalOrBoundGenericNominal())
+      if (TyDecl->getAttrs().getAttribute<AlignmentAttr>())
+        return false;
+  return true;
 }
 
 DebugTypeInfo DebugTypeInfo::getFromTypeInfo(DeclContext *DC,
@@ -50,41 +57,33 @@ DebugTypeInfo DebugTypeInfo::getFromTypeInfo(DeclContext *DC,
     size = Size(0);
   }
   return DebugTypeInfo(DC, GE, Ty.getPointer(), Info.getStorageType(), size,
-                       Info.getBestKnownAlignment());
+                       Info.getBestKnownAlignment(), hasDefaultAlignment(Ty));
 }
 
 DebugTypeInfo DebugTypeInfo::getLocalVariable(DeclContext *DC,
                                               GenericEnvironment *GE,
                                               VarDecl *Decl, swift::Type Ty,
-                                              const TypeInfo &Info,
-                                              bool Unwrap) {
+                                              const TypeInfo &Info) {
 
-  auto DeclType = (Decl->hasType()
-                   ? Decl->getType()
-                   : Decl->getDeclContext()->mapTypeIntoContext(
-                     Decl->getInterfaceType()));
+  auto DeclType = Decl->getInterfaceType();
   auto RealType = Ty;
-  if (Unwrap) {
-    DeclType = DeclType->getInOutObjectType();
-    RealType = RealType->getInOutObjectType();
-  }
 
   // DynamicSelfType is also sugar as far as debug info is concerned.
-  auto DeclSelfType = DeclType;
+  auto Sugared = DeclType;
   if (auto DynSelfTy = DeclType->getAs<DynamicSelfType>())
-    DeclSelfType = DynSelfTy->getSelfType();
+    Sugared = DynSelfTy->getSelfType();
 
   // Prefer the original, potentially sugared version of the type if
   // the type hasn't been mucked with by an optimization pass.
-  auto *Type = DeclSelfType->isEqual(RealType) ? DeclType.getPointer()
-                                               : RealType.getPointer();
+  auto *Type = Sugared->isEqual(RealType) ? DeclType.getPointer()
+                                          : RealType.getPointer();
   return getFromTypeInfo(DC, GE, Type, Info);
 }
 
 DebugTypeInfo DebugTypeInfo::getMetadata(swift::Type Ty, llvm::Type *StorageTy,
                                          Size size, Alignment align) {
   DebugTypeInfo DbgTy(nullptr, nullptr, Ty.getPointer(), StorageTy, size,
-                      align);
+                      align, true);
   assert(!DbgTy.isArchetype() && "type metadata cannot contain an archetype");
   return DbgTy;
 }
@@ -96,21 +95,20 @@ DebugTypeInfo DebugTypeInfo::getGlobal(SILGlobalVariable *GV,
   // the type hasn't been mucked with by an optimization pass.
   DeclContext *DC = nullptr;
   GenericEnvironment *GE = nullptr;
-  auto LowTy = GV->getLoweredType().getSwiftRValueType();
+  auto LowTy = GV->getLoweredType().getASTType();
   auto *Type = LowTy.getPointer();
   if (auto *Decl = GV->getDecl()) {
     DC = Decl->getDeclContext();
     GE = DC->getGenericEnvironmentOfContext();
-    auto DeclType =
-        (Decl->hasType() ? Decl->getType()
-                         : DC->mapTypeIntoContext(Decl->getInterfaceType()));
+    auto DeclType = Decl->getType();
     if (DeclType->isEqual(LowTy))
       Type = DeclType.getPointer();
   }
-  DebugTypeInfo DbgTy(DC, GE, Type, StorageTy, size, align);
+  DebugTypeInfo DbgTy(DC, GE, Type, StorageTy, size, align,
+                      hasDefaultAlignment(Type));
   assert(StorageTy && "StorageType is a nullptr");
   assert(!DbgTy.isArchetype() &&
-         "type of a global var cannot contain an archetype");
+         "type of global variable cannot be an archetype");
   assert(align.getValue() != 0);
   return DbgTy;
 }
@@ -120,33 +118,15 @@ DebugTypeInfo DebugTypeInfo::getObjCClass(ClassDecl *theClass,
                                           Alignment align) {
   DebugTypeInfo DbgTy(nullptr, nullptr,
                       theClass->getInterfaceType().getPointer(), StorageType,
-                      size, align);
-  assert(!DbgTy.isArchetype() &&
-         "type of an objc class cannot contain an archetype");
+                      size, align, true);
+  assert(!DbgTy.isArchetype() && "type of objc class cannot be an archetype");
   return DbgTy;
 }
 
-static bool typesEqual(Type A, Type B) {
-  if (A.getPointer() == B.getPointer())
-    return true;
-
-  // nullptr.
-  if (A.isNull() || B.isNull())
-    return false;
-
-  // Tombstone.
-  auto Tombstone =
-      llvm::DenseMapInfo<swift::Type>::getTombstoneKey().getPointer();
-  if ((A.getPointer() == Tombstone) || (B.getPointer() == Tombstone))
-    return false;
-
-  // Pointers are safe, do the real comparison.
-  return A->isSpelledLike(B.getPointer());
-}
-
 bool DebugTypeInfo::operator==(DebugTypeInfo T) const {
-  return typesEqual(getType(), T.getType()) && size == T.size &&
-         align == T.align;
+  return (getType() == T.getType() &&
+          size == T.size &&
+          align == T.align);
 }
 
 bool DebugTypeInfo::operator!=(DebugTypeInfo T) const { return !operator==(T); }
@@ -154,8 +134,8 @@ bool DebugTypeInfo::operator!=(DebugTypeInfo T) const { return !operator==(T); }
 TypeDecl *DebugTypeInfo::getDecl() const {
   if (auto *N = dyn_cast<NominalType>(Type))
     return N->getDecl();
-  if (auto *TA = dyn_cast<NameAliasType>(Type))
-    return TA->getDecl();
+  if (auto *BTA = dyn_cast<NameAliasType>(Type))
+    return BTA->getDecl();
   if (auto *UBG = dyn_cast<UnboundGenericType>(Type))
     return UBG->getDecl();
   if (auto *BG = dyn_cast<BoundGenericType>(Type))

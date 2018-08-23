@@ -78,15 +78,29 @@ SILValue SILSSAUpdater::GetValueAtEndOfBlock(SILBasicBlock *BB) {
 
 /// Are all available values identicalTo each other.
 bool areIdentical(AvailableValsTy &Avails) {
-  auto *First = dyn_cast<SILInstruction>(Avails.begin()->second);
-  if (!First)
+  if (auto *First = dyn_cast<SingleValueInstruction>(Avails.begin()->second)) {
+    for (auto Avail : Avails) {
+      auto *Inst = dyn_cast<SingleValueInstruction>(Avail.second);
+      if (!Inst)
+        return false;
+      if (!Inst->isIdenticalTo(First))
+        return false;
+    }
+    return true;
+  }
+
+  auto *MVIR = dyn_cast<MultipleValueInstructionResult>(Avails.begin()->second);
+  if (!MVIR)
     return false;
+
   for (auto Avail : Avails) {
-    auto *Inst = dyn_cast<SILInstruction>(Avail.second);
-    if (!Inst)
+    auto *Result = dyn_cast<MultipleValueInstructionResult>(Avail.second);
+    if (!Result)
       return false;
-    if (!Inst->isIdenticalTo(First))
+    if (!Result->getParent()->isIdenticalTo(MVIR->getParent()) ||
+        Result->getIndex() != MVIR->getIndex()) {
       return false;
+    }
   }
   return true;
 }
@@ -100,7 +114,7 @@ void SILSSAUpdater::RewriteUse(Operand &Op) {
     assert(areIdentical(getAvailVals(AV)) &&
            "The function_refs need to have the same value");
     SILInstruction *User = Op.getUser();
-    auto *NewFR = FR->clone(User);
+    auto *NewFR = cast<FunctionRefInst>(FR->clone(User));
     Op.set(NewFR);
     return;
   } else if (auto *IL = dyn_cast<IntegerLiteralInst>(Op.get()))
@@ -108,7 +122,7 @@ void SILSSAUpdater::RewriteUse(Operand &Op) {
       // Some llvm intrinsics don't like phi nodes as their constant inputs (e.g
       // ctlz).
       SILInstruction *User = Op.getUser();
-      auto *NewIL = IL->clone(User);
+      auto *NewIL = cast<IntegerLiteralInst>(IL->clone(User));
       Op.set(NewIL);
       return;
     }
@@ -233,29 +247,6 @@ public:
   typedef SILBasicBlock::succ_iterator BlkSucc_iterator;
   static BlkSucc_iterator BlkSucc_begin(BlkT *BB) { return BB->succ_begin(); }
   static BlkSucc_iterator BlkSucc_end(BlkT *BB) { return BB->succ_end(); }
-
-  /// Iterator over the arguments (phis) of a basic block.
-  /// Defines an implicit cast operator on the iterator. So that this iterator
-  /// can be used in the SSAUpdaterImpl.
-  class PhiIt {
-  private:
-    SILBasicBlock::arg_iterator It;
-
-  public:
-    explicit PhiIt(SILBasicBlock *B) // begin iterator
-        : It(B->args_begin()) {}
-    PhiIt(SILBasicBlock *B, bool) // end iterator
-        : It(B->args_end()) {}
-    PhiIt &operator++() { ++It; return *this; }
-
-    operator SILPHIArgument *() { return cast<SILPHIArgument>(*It); }
-    bool operator==(const PhiIt& x) const { return It == x.It; }
-    bool operator!=(const PhiIt& x) const { return !operator==(x); }
-  };
-
-  typedef PhiIt PhiItT;
-  static PhiItT PhiItT_begin(BlkT *BB) { return PhiIt(BB); }
-  static PhiItT PhiItT_end(BlkT *BB) { return PhiIt(BB, true); }
 
   /// Iterator for PHI operands.
   class PHI_iterator {
@@ -531,7 +522,7 @@ replaceBBArgWithStruct(SILPHIArgument *Arg,
 /// detection like induction variable analysis to succeed.
 ///
 /// If Arg is replaced, return the cast instruction. Otherwise return nullptr.
-SILInstruction *swift::replaceBBArgWithCast(SILPHIArgument *Arg) {
+SILValue swift::replaceBBArgWithCast(SILPHIArgument *Arg) {
   SmallVector<SILValue, 4> ArgValues;
   Arg->getIncomingValues(ArgValues);
   if (isa<StructInst>(ArgValues[0]))

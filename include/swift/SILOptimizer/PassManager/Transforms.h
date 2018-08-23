@@ -66,8 +66,19 @@ namespace swift {
     /// Inject the pass manager running this pass.
     void injectPassManager(SILPassManager *PMM) { PM = PMM; }
 
-    /// Get the name of the transform.
-    virtual llvm::StringRef getName() = 0;
+    SILPassManager *getPassManager() const { return PM; }
+
+    irgen::IRGenModule *getIRGenModule() {
+      auto *Mod = PM->getIRGenModule();
+      assert(Mod && "Expecting a valid module");
+      return Mod;
+    }
+
+    /// Get the transform's (command-line) tag.
+    llvm::StringRef getTag() { return PassKindTag(getPassKind()); }
+
+    /// Get the transform's name as a C++ identifier.
+    llvm::StringRef getID() { return PassKindID(getPassKind()); }
 
   protected:
     /// \brief Searches for an analysis of type T in the list of registered
@@ -104,23 +115,16 @@ namespace swift {
     /// derived from a common base function, e.g. due to specialization.
     /// The number should be small anyway, but bugs in optimizations could cause
     /// an infinite loop in the passmanager.
-    void notifyAddFunction(SILFunction *F, SILFunction *DerivedFrom) {
+    void addFunctionToPassManagerWorklist(SILFunction *F,
+                                          SILFunction *DerivedFrom) {
       PM->addFunctionToWorklist(F, DerivedFrom);
-      PM->notifyAnalysisOfFunction(F);
     }
 
     /// \brief Reoptimize the current function by restarting the pass
     /// pipeline on it.
     void restartPassPipeline() { PM->restartWithCurrentFunction(this); }
 
-  protected:
     SILFunction *getFunction() { return F; }
-
-    irgen::IRGenModule *getIRGenModule() {
-      auto *Mod = PM->getIRGenModule();
-      assert(Mod && "Expecting a valid module");
-      return Mod;
-    }
 
     void invalidateAnalysis(SILAnalysis::InvalidationKind K) {
       PM->invalidateAnalysis(F, K);
@@ -146,7 +150,7 @@ namespace swift {
 
     SILModule *getModule() { return M; }
 
-    /// Invalidate all analsysis data for the whole module.
+    /// Invalidate all analysis data for the whole module.
     void invalidateAll() {
       PM->invalidateAllAnalysis();
     }
@@ -161,14 +165,9 @@ namespace swift {
       PM->invalidateFunctionTables();
     }
 
-    /// Inform the pass manager of a deleted function.
-    void notifyDeleteFunction(SILFunction *F) {
-      PM->notifyDeleteFunction(F);
-    }
-
-    /// Inform the pass manager of an added function.
-    void notifyAddFunction(SILFunction *F) {
-      PM->notifyAnalysisOfFunction(F);
+    /// Inform the pass manager that we are going to delete a function.
+    void notifyWillDeleteFunction(SILFunction *F) {
+      PM->notifyWillDeleteFunction(F);
     }
   };
 } // end namespace swift

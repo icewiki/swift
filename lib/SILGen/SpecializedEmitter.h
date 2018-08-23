@@ -26,7 +26,6 @@ class Expr;
 struct SILDeclRef;
 class SILLocation;
 class SILModule;
-class Substitution;
   
 namespace Lowering {
 class ManagedValue;
@@ -41,18 +40,16 @@ public:
   /// have already been emitted.
   using EarlyEmitter = ManagedValue (SILGenFunction &,
                                      SILLocation,
-                                     SubstitutionList,
+                                     SubstitutionMap,
                                      Expr *argument,
-                                     CanFunctionType formalApplyType,
                                      SGFContext);
 
   /// A special function for emitting a call after the arguments
   /// have already been emitted.
   using LateEmitter = ManagedValue (SILGenFunction &,
                                     SILLocation,
-                                    SubstitutionList,
+                                    SubstitutionMap,
                                     ArrayRef<ManagedValue>,
-                                    CanFunctionType formalApplyType,
                                     SGFContext);
 
   enum class Kind {

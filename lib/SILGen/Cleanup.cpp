@@ -11,6 +11,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "Cleanup.h"
+#include "ManagedValue.h"
+#include "RValue.h"
+#include "SILGenBuilder.h"
 #include "SILGenFunction.h"
 
 using namespace swift;
@@ -34,6 +37,7 @@ namespace {
   public:
     CleanupBuffer(const Cleanup &cleanup) {
       size_t size = cleanup.allocated_size();
+      data.reserve(size);
       data.set_size(size);
       memcpy(data.data(), reinterpret_cast<const void *>(&cleanup), size);
     }
@@ -52,47 +56,71 @@ void CleanupManager::popTopDeadCleanups(CleanupsDepth end) {
   }
 }
 
+void CleanupManager::popAndEmitCleanup(CleanupHandle handle,
+                                       CleanupLocation loc,
+                                       ForUnwind_t forUnwind) {
+  auto iter = stack.find(handle);
+  Cleanup &stackCleanup = *iter;
+
+  // Copy the cleanup off the cleanup stack.
+  CleanupBuffer buffer(stackCleanup);
+  Cleanup &cleanup = buffer.getCopy();
+
+  // Deactivate it.
+  forwardCleanup(handle);
+
+  // Emit the cleanup.
+  cleanup.emit(SGF, loc, forUnwind);
+}
+
 void CleanupManager::emitCleanups(CleanupsDepth depth, CleanupLocation loc,
-                                  bool popCleanups) {
-  auto begin = stack.stable_begin();
-  while (begin != depth) {
-    auto iter = stack.find(begin);
-
+                                  ForUnwind_t forUnwind, bool popCleanups) {
+  auto cur = stack.stable_begin();
+#ifndef NDEBUG
+  auto topOfStack = cur;
+#endif
+  while (cur != depth) {
+    // Copy the cleanup off the stack if it needs to be emitted.
+    // This is necessary both because we might need to pop the cleanup and
+    // because the cleanup might push other cleanups that will invalidate
+    // references onto the stack.
+    auto iter = stack.find(cur);
     Cleanup &stackCleanup = *iter;
+    Optional<CleanupBuffer> copiedCleanup;
+    if (stackCleanup.isActive() && SGF.B.hasValidInsertionPoint()) {
+      copiedCleanup.emplace(stackCleanup);
+    }
 
-    // Copy it off the cleanup stack in case the cleanup pushes a new cleanup
-    // and the backing storage is re-allocated.
-    CleanupBuffer buffer(stackCleanup);
-    Cleanup &cleanup = buffer.getCopy();
+    // Advance the iterator.
+    cur = stack.stabilize(++iter);
 
-    // Advance stable iterator.
-    begin = stack.stabilize(++iter);
-
-    // Pop now.
-    if (popCleanups)
+    // Pop now if that was requested.
+    if (popCleanups) {
       stack.pop();
 
-    if (cleanup.isActive() && SGF.B.hasValidInsertionPoint())
-      cleanup.emit(SGF, loc);
+#ifndef NDEBUG
+      topOfStack = stack.stable_begin();
+#endif
+    }
 
-    stack.checkIterator(begin);
+    // Emit the cleanup.
+    if (copiedCleanup) {
+      copiedCleanup->getCopy().emit(SGF, loc, forUnwind);
+#ifndef NDEBUG
+      if (hasAnyActiveCleanups(stack.stable_begin(), topOfStack)) {
+        copiedCleanup->getCopy().dump(SGF);
+        llvm_unreachable("cleanup left active cleanups on stack");
+      }
+#endif
+    }
+
+    stack.checkIterator(cur);
   }
 }
 
-/// Leave a scope, with all its cleanups.
+/// Leave a scope, emitting all the cleanups that are currently active.
 void CleanupManager::endScope(CleanupsDepth depth, CleanupLocation loc) {
-  stack.checkIterator(depth);
-
-  // FIXME: Thread a branch through the cleanups if there are any active
-  // cleanups and we have a valid insertion point.
-
-  if (!::hasAnyActiveCleanups(stack.begin(), stack.find(depth))) {
-    return;
-  }
-  
-  // Iteratively mark cleanups dead and pop them.
-  // Maybe we'd get better results if we marked them all dead in one shot?
-  emitCleanups(depth, loc);
+  emitCleanups(depth, loc, NotForUnwind, /*popCleanups*/ true);
 }
 
 bool CleanupManager::hasAnyActiveCleanups(CleanupsDepth from,
@@ -108,19 +136,21 @@ bool CleanupManager::hasAnyActiveCleanups(CleanupsDepth from) {
 /// threading out through any cleanups we might need to run.  This does not
 /// pop the cleanup stack.
 void CleanupManager::emitBranchAndCleanups(JumpDest dest, SILLocation branchLoc,
-                                           ArrayRef<SILValue> args) {
+                                           ArrayRef<SILValue> args,
+                                           ForUnwind_t forUnwind) {
   SILGenBuilder &builder = SGF.getBuilder();
   assert(builder.hasValidInsertionPoint() && "Emitting branch in invalid spot");
   emitCleanups(dest.getDepth(), dest.getCleanupLocation(),
-               /*popCleanups=*/false);
+               forUnwind, /*popCleanups=*/false);
   builder.createBranch(branchLoc, dest.getBlock(), args);
 }
 
-void CleanupManager::emitCleanupsForReturn(CleanupLocation loc) {
+void CleanupManager::emitCleanupsForReturn(CleanupLocation loc,
+                                           ForUnwind_t forUnwind) {
   SILGenBuilder &builder = SGF.getBuilder();
   assert(builder.hasValidInsertionPoint() && "Emitting return in invalid spot");
   (void)builder;
-  emitCleanups(stack.stable_end(), loc, /*popCleanups=*/false);
+  emitCleanups(stack.stable_end(), loc, forUnwind, /*popCleanups=*/false);
 }
 
 /// Emit a new block that jumps to the specified location and runs necessary
@@ -128,15 +158,16 @@ void CleanupManager::emitCleanupsForReturn(CleanupLocation loc) {
 /// returns the dest block.
 SILBasicBlock *CleanupManager::emitBlockForCleanups(JumpDest dest,
                                                     SILLocation branchLoc,
-                                                    ArrayRef<SILValue> args) {
+                                                    ArrayRef<SILValue> args,
+                                                    ForUnwind_t forUnwind) {
   // If there are no cleanups to run, just return the Dest block directly.
   if (!hasAnyActiveCleanups(dest.getDepth()))
     return dest.getBlock();
 
   // Otherwise, create and emit a new block.
   auto *newBlock = SGF.createBasicBlock();
-  SavedInsertionPoint IPRAII(SGF, newBlock);
-  emitBranchAndCleanups(dest, branchLoc, args);
+  SILGenSavedInsertionPoint IPRAII(SGF, newBlock);
+  emitBranchAndCleanups(dest, branchLoc, args, forUnwind);
   return newBlock;
 }
 
@@ -275,4 +306,42 @@ void CleanupManager::dump(CleanupHandle handle) const {
   const Cleanup &stackCleanup = *iter;
   llvm::errs() << "CLEANUP DEPTH: " << handle.getDepth() << "\n";
   stackCleanup.dump(SGF);
+}
+
+void CleanupManager::checkIterator(CleanupHandle handle) const {
+#ifndef NDEBUG
+  stack.checkIterator(handle);
+#endif
+}
+
+//===----------------------------------------------------------------------===//
+//                               Cleanup Cloner
+//===----------------------------------------------------------------------===//
+
+CleanupCloner::CleanupCloner(SILGenFunction &SGF, const ManagedValue &mv)
+    : SGF(SGF), hasCleanup(mv.hasCleanup()), isLValue(mv.isLValue()) {}
+
+CleanupCloner::CleanupCloner(SILGenBuilder &builder, const ManagedValue &mv)
+    : CleanupCloner(builder.getSILGenFunction(), mv) {}
+
+CleanupCloner::CleanupCloner(SILGenFunction &SGF, const RValue &rv)
+    : SGF(SGF), hasCleanup(rv.isPlusOne(SGF)), isLValue(false) {}
+
+CleanupCloner::CleanupCloner(SILGenBuilder &builder, const RValue &rv)
+    : CleanupCloner(builder.getSILGenFunction(), rv) {}
+
+ManagedValue CleanupCloner::clone(SILValue value) const {
+  if (isLValue) {
+    return ManagedValue::forLValue(value);
+  }
+
+  if (!hasCleanup) {
+    return ManagedValue::forUnmanaged(value);
+  }
+
+  if (value->getType().isAddress()) {
+    return SGF.emitManagedBufferWithCleanup(value);
+  }
+
+  return SGF.emitManagedRValueWithCleanup(value);
 }

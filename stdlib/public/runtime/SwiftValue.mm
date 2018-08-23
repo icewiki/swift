@@ -24,6 +24,7 @@
 #include "SwiftObject.h"
 #include "SwiftValue.h"
 #include "swift/Basic/Lazy.h"
+#include "swift/Runtime/Casting.h"
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Runtime/Metadata.h"
 #include "swift/Runtime/ObjCBridge.h"
@@ -212,42 +213,32 @@ _SwiftValue *swift::getAsSwiftValue(id object) {
 }
 
 bool
-swift::findSwiftValueConformances(const ProtocolDescriptorList &protocols,
+swift::findSwiftValueConformances(const ExistentialTypeMetadata *existentialType,
                                   const WitnessTable **tablesBuffer) {
+  // _SwiftValue never satisfies a superclass constraint.
+  if (existentialType->getSuperclassConstraint() != nullptr)
+    return false;
+
   Class cls = nullptr;
 
   // Note that currently we never modify tablesBuffer because
   // _SwiftValue doesn't conform to any protocols that need witness tables.
 
-  for (size_t i = 0, e = protocols.NumProtocols; i != e; ++i) {
-    auto protocol = protocols[i];
-
-    // _SwiftValue does conform to AnyObject.
-    switch (protocol->Flags.getSpecialProtocol()) {
-    case SpecialProtocol::AnyObject:
-      continue;
-
-    case SpecialProtocol::Error:
-      return false;
-
-    case SpecialProtocol::None:
-      break;
-    }
-
-    // Otherwise, it only conforms to ObjC protocols.  We specifically
+  for (auto protocol : existentialType->getProtocols()) {
+    // _SwiftValue only conforms to ObjC protocols.  We specifically
     // don't want to say that _SwiftValue conforms to the Swift protocols
     // that NSObject conforms to because that would create a situation
     // where arguably an arbitrary type would conform to those protocols
     // by way of coercion through _SwiftValue.  Eventually we want to
     // change _SwiftValue to not be an NSObject subclass at all.
 
-    if (protocol->Flags.getDispatchStrategy() != ProtocolDispatchStrategy::ObjC)
+    if (!protocol.isObjC())
       return false;
 
     if (!cls) cls = _getSwiftValueClass();
 
     // Check whether the class conforms to the protocol.
-    if (![cls conformsToProtocol: (Protocol*) protocol])
+    if (![cls conformsToProtocol: protocol.getObjCProtocol()])
       return false;
   }
 
@@ -321,7 +312,7 @@ swift::findSwiftValueConformances(const ProtocolDescriptorList &protocols,
     return NO;
   }
 
-  return swift_stdlib_Hashable_isEqual_indirect(
+  return _swift_stdlib_Hashable_isEqual_indirect(
       getSwiftValuePayload(self,
                            getSwiftValuePayloadAlignMask(selfHeader->type)),
       getSwiftValuePayload(other,
@@ -335,36 +326,25 @@ swift::findSwiftValueConformances(const ProtocolDescriptorList &protocols,
   if (!hashableConformance) {
     return (NSUInteger)self;
   }
-  return swift_stdlib_Hashable_hashValue_indirect(
+  return _swift_stdlib_Hashable_hashValue_indirect(
       getSwiftValuePayload(self,
                            getSwiftValuePayloadAlignMask(selfHeader->type)),
       selfHeader->type, hashableConformance);
 }
 
 static NSString *getValueDescription(_SwiftValue *self) {
-  String tmp;
   const Metadata *type;
   const OpaqueValue *value;
   std::tie(type, value) = getValueFromSwiftValue(self);
 
   // Copy the value, since it will be consumed by getSummary.
   ValueBuffer copyBuf;
-#ifdef SWIFT_RUNTIME_ENABLE_COW_EXISTENTIALS
   auto copy = type->allocateBufferIn(&copyBuf);
   type->vw_initializeWithCopy(copy, const_cast<OpaqueValue *>(value));
-#else
-  auto copy = type->vw_initializeBufferWithCopy(&copyBuf,
-                                              const_cast<OpaqueValue*>(value));
-#endif
 
-  swift_getSummary(&tmp, copy, type);
-
-#ifdef SWIFT_RUNTIME_ENABLE_COW_EXISTENTIALS
+  NSString *string = getDescription(copy, type);
   type->deallocateBufferIn(&copyBuf);
-#else
-  type->vw_deallocateBuffer(&copyBuf);
-#endif
-  return convertStringToNSString(&tmp);
+  return string;
 }
 
 - (NSString *)description {
@@ -380,10 +360,10 @@ static NSString *getValueDescription(_SwiftValue *self) {
   return getSwiftValueTypeMetadata(self);
 }
 - (NSString *)_swiftTypeName {
-  TwoWordPair<const char *, uintptr_t> typeName
+  TypeNamePair typeName
     = swift_getTypeName(getSwiftValueTypeMetadata(self), true);
 
-  return [NSString stringWithUTF8String: typeName.first];
+  return [NSString stringWithUTF8String: typeName.data];
 }
 - (const OpaqueValue *)_swiftValue {
   return getValueFromSwiftValue(self).second;

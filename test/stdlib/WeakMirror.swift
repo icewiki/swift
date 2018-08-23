@@ -9,8 +9,7 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
+// RUN: %empty-directory(%t)
 //
 // RUN: if [ %target-runtime == "objc" ]; \
 // RUN: then \
@@ -19,6 +18,7 @@
 // RUN: else \
 // RUN:   %target-build-swift %s -Xfrontend -disable-access-control -o %t/Mirror; \
 // RUN: fi
+// RUN: %target-codesign %t/Mirror
 // RUN: %target-run %t/Mirror
 // REQUIRES: executable_test
 
@@ -104,7 +104,7 @@ mirrors.test("struct/StructHasNativeWeakReference") {
 import Foundation
 
 @objc protocol ObjCClassExistential : class {
-  weak var weakProperty: AnyObject? { get set }
+  var weakProperty: AnyObject? { get set }
   var x: Int { get }
 }
 

@@ -4,6 +4,7 @@ module SwiftShims {
   header "FoundationShims.h"
   header "GlobalObjects.h"
   header "HeapObject.h"
+  header "KeyPath.h"
   header "LibcShims.h"
   header "RefCount.h"
   header "RuntimeShims.h"
@@ -11,6 +12,7 @@ module SwiftShims {
   header "SwiftStdbool.h"
   header "SwiftStddef.h"
   header "SwiftStdint.h"
+  header "System.h"
   header "UnicodeShims.h"
   header "Visibility.h"
   export *
@@ -39,6 +41,10 @@ module _SwiftSafariServicesOverlayShims {
   header "SafariServicesOverlayShims.h"
 }
 
+module _SwiftUIKitOverlayShims {
+  header "UIKitOverlayShims.h"
+}
+
 module _SwiftXCTestOverlayShims {
   header "XCTestOverlayShims.h"
 }
@@ -53,4 +59,8 @@ module _SwiftCoreFoundationOverlayShims {
 
 module _SwiftFoundationOverlayShims {
   header "FoundationOverlayShims.h"
+}
+
+module _SwiftNetworkOverlayShims {
+  header "NetworkOverlayShims.h"
 }

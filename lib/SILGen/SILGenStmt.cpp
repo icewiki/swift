@@ -10,14 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "SILGen.h"
+#include "ArgumentSource.h"
 #include "Condition.h"
 #include "Initialization.h"
 #include "LValue.h"
 #include "RValue.h"
+#include "SILGen.h"
 #include "Scope.h"
-#include "SwitchCaseFullExpr.h"
+#include "SwitchEnumBuilder.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/SILArgument.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -31,17 +33,22 @@ static void diagnose(ASTContext &Context, SourceLoc loc, Diag<T...> diag,
                          diag, std::forward<U>(args)...);
 }
 
-SILBasicBlock *SILGenFunction::createBasicBlock(SILBasicBlock *afterBB) {
-  // Honor an explicit placement if given.
-  if (afterBB) {
-    return F.createBasicBlock(afterBB);
+SILBasicBlock *SILGenFunction::createBasicBlockAfter(SILBasicBlock *afterBB) {
+  assert(afterBB);
+  return F.createBasicBlockAfter(afterBB);
+}
 
-    // If we don't have a requested placement, but we do have a current
-    // insertion point, insert there.
-  } else if (B.hasValidInsertionPoint()) {
-    return F.createBasicBlock(B.getInsertionBB());
+SILBasicBlock *SILGenFunction::createBasicBlockBefore(SILBasicBlock *beforeBB) {
+  assert(beforeBB);
+  return F.createBasicBlockBefore(beforeBB);
+}
 
-    // Otherwise, insert at the end of the current section.
+SILBasicBlock *SILGenFunction::createBasicBlock() {
+  // If we have a current insertion point, insert there.
+  if (B.hasValidInsertionPoint()) {
+    return F.createBasicBlockAfter(B.getInsertionBB());
+
+  // Otherwise, insert at the end of the current section.
   } else {
     return createBasicBlock(CurFunctionSection);
   }
@@ -52,16 +59,17 @@ SILBasicBlock *SILGenFunction::createBasicBlock(FunctionSection section) {
   case FunctionSection::Ordinary: {
     // The end of the ordinary section is just the end of the function
     // unless postmatter blocks exist.
-    SILBasicBlock *afterBB = (StartOfPostmatter != F.end())
-                                 ? &*std::prev(StartOfPostmatter)
-                                 : nullptr;
-    return F.createBasicBlock(afterBB);
+    if (StartOfPostmatter != F.end()) {
+      return F.createBasicBlockBefore(&*StartOfPostmatter);
+    } else {
+      return F.createBasicBlock();
+    }
   }
 
   case FunctionSection::Postmatter: {
     // The end of the postmatter section is always the end of the function.
     // Register the new block as the start of the postmatter if needed.
-    SILBasicBlock *newBB = F.createBasicBlock(nullptr);
+    SILBasicBlock *newBB = F.createBasicBlock();
     if (StartOfPostmatter == F.end())
       StartOfPostmatter = newBB->getIterator();
     return newBB;
@@ -138,9 +146,11 @@ static void emitOrDeleteBlock(SILGenFunction &SGF, JumpDest &dest,
     SGF.B.emitBlock(BB, BranchLoc);
 }
 
-Condition SILGenFunction::emitCondition(Expr *E,
-                                        bool hasFalseCode, bool invertValue,
-                                        ArrayRef<SILType> contArgs) {
+Condition SILGenFunction::emitCondition(Expr *E, bool hasFalseCode,
+                                        bool invertValue,
+                                        ArrayRef<SILType> contArgs,
+                                        ProfileCounter NumTrueTaken,
+                                        ProfileCounter NumFalseTaken) {
   assert(B.hasValidInsertionPoint() &&
          "emitting condition at unreachable point");
 
@@ -152,14 +162,15 @@ Condition SILGenFunction::emitCondition(Expr *E,
   }
   assert(V->getType().castTo<BuiltinIntegerType>()->isFixedWidth(1));
 
-  return emitCondition(V, E, hasFalseCode, invertValue, contArgs);
+  return emitCondition(V, E, hasFalseCode, invertValue, contArgs, NumTrueTaken,
+                       NumFalseTaken);
 }
-
-
 
 Condition SILGenFunction::emitCondition(SILValue V, SILLocation Loc,
                                         bool hasFalseCode, bool invertValue,
-                                        ArrayRef<SILType> contArgs) {
+                                        ArrayRef<SILType> contArgs,
+                                        ProfileCounter NumTrueTaken,
+                                        ProfileCounter NumFalseTaken) {
   assert(B.hasValidInsertionPoint() &&
          "emitting condition at unreachable point");
 
@@ -180,10 +191,12 @@ Condition SILGenFunction::emitCondition(SILValue V, SILLocation Loc,
   SILBasicBlock *TrueBB = createBasicBlock();
 
   if (invertValue)
-    B.createCondBranch(Loc, V, FalseDestBB, TrueBB);
+    B.createCondBranch(Loc, V, FalseDestBB, TrueBB, NumFalseTaken,
+                       NumTrueTaken);
   else
-    B.createCondBranch(Loc, V, TrueBB, FalseDestBB);
-  
+    B.createCondBranch(Loc, V, TrueBB, FalseDestBB, NumTrueTaken,
+                       NumFalseTaken);
+
   return Condition(TrueBB, FalseBB, ContBB, Loc);
 }
 
@@ -200,8 +213,8 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
   
   for (auto &ESD : S->getElements()) {
     
-    if (auto S = ESD.dyn_cast<Stmt*>())
-      if (isa<IfConfigStmt>(S))
+    if (auto D = ESD.dyn_cast<Decl*>())
+      if (isa<IfConfigDecl>(D))
         continue;
     
     // If we ever reach an unreachable point, stop emitting statements and issue
@@ -209,10 +222,25 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
     if (!SGF.B.hasValidInsertionPoint()) {
       // If this is an implicit statement or expression, just skip over it,
       // don't emit a diagnostic here.
-      if (Stmt *S = ESD.dyn_cast<Stmt*>()) {
+      if (auto *S = ESD.dyn_cast<Stmt*>()) {
         if (S->isImplicit()) continue;
-      } else if (Expr *E = ESD.dyn_cast<Expr*>()) {
-        if (E->isImplicit()) continue;
+      } else if (auto *E = ESD.dyn_cast<Expr*>()) {
+        // Optional chaining expressions are wrapped in a structure like.
+        //
+        // (optional_evaluation_expr implicit type='T?'
+        //   (call_expr type='T?'
+        //     (exprs...
+        //
+        // Walk through it to find out if the statement is actually implicit.
+        if (auto *OEE = dyn_cast<OptionalEvaluationExpr>(E)) {
+          if (auto *IIO = dyn_cast<InjectIntoOptionalExpr>(OEE->getSubExpr()))
+            if (IIO->getSubExpr()->isImplicit()) continue;
+          if (auto *C = dyn_cast<CallExpr>(OEE->getSubExpr()))
+            if (C->isImplicit()) continue;
+        } else if (E->isImplicit()) {
+          // Ignore all other implicit expressions.
+          continue;
+        }
       }
       
       if (StmtType != UnknownStmtType) {
@@ -226,7 +254,7 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
     }
 
     // Process children.
-    if (Stmt *S = ESD.dyn_cast<Stmt*>()) {
+    if (auto *S = ESD.dyn_cast<Stmt*>()) {
       visit(S);
       if (isa<ReturnStmt>(S))
         StmtType = ReturnStmtType;
@@ -236,7 +264,7 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
         StmtType = ContinueStmtType;
       if (isa<ThrowStmt>(S))
         StmtType = ThrowStmtType;
-    } else if (Expr *E = ESD.dyn_cast<Expr*>()) {
+    } else if (auto *E = ESD.dyn_cast<Expr*>()) {
       SGF.emitIgnoredExpr(E);
     } else {
       SGF.visit(ESD.get<Decl*>());
@@ -253,8 +281,7 @@ namespace {
                               SmallVectorImpl<CleanupHandle> &cleanups)
       : Storage(storage), Cleanups(cleanups) {}
 
-    SILValue getAddressOrNull() const override { return SILValue(); }
-    void copyOrInitValueInto(SILGenFunction &gen, SILLocation loc,
+    void copyOrInitValueInto(SILGenFunction &SGF, SILLocation loc,
                              ManagedValue value, bool isInit) override {
       Storage = value.getValue();
       auto cleanup = value.getCleanup();
@@ -264,7 +291,7 @@ namespace {
 } // end anonymous namespace
 
 static InitializationPtr
-prepareIndirectResultInit(SILGenFunction &gen, CanType resultType,
+prepareIndirectResultInit(SILGenFunction &SGF, CanType resultType,
                           ArrayRef<SILResultInfo> &allResults,
                           MutableArrayRef<SILValue> &directResults,
                           ArrayRef<SILArgument*> &indirectResultAddrs,
@@ -275,7 +302,7 @@ prepareIndirectResultInit(SILGenFunction &gen, CanType resultType,
     tupleInit->SubInitializations.reserve(resultTupleType->getNumElements());
 
     for (auto resultEltType : resultTupleType.getElementTypes()) {
-      auto eltInit = prepareIndirectResultInit(gen, resultEltType, allResults,
+      auto eltInit = prepareIndirectResultInit(SGF, resultEltType, allResults,
                                                directResults,
                                                indirectResultAddrs, cleanups);
       tupleInit->SubInitializations.push_back(std::move(eltInit));
@@ -289,14 +316,14 @@ prepareIndirectResultInit(SILGenFunction &gen, CanType resultType,
   allResults = allResults.slice(1);
 
   // If it's indirect, we should be emitting into an argument.
-  if (gen.silConv.isSILIndirect(result)) {
+  if (SGF.silConv.isSILIndirect(result)) {
     // Pull off the next indirect result argument.
     SILValue addr = indirectResultAddrs.front();
     indirectResultAddrs = indirectResultAddrs.slice(1);
 
     // Create an initialization which will initialize it.
-    auto &resultTL = gen.getTypeLowering(addr->getType());
-    auto temporary = gen.useBufferAsTemporary(addr, resultTL);
+    auto &resultTL = SGF.getTypeLowering(addr->getType());
+    auto temporary = SGF.useBufferAsTemporary(addr, resultTL);
 
     // Remember the cleanup that will be activated.
     auto cleanup = temporary->getInitializedCleanup();
@@ -321,19 +348,19 @@ prepareIndirectResultInit(SILGenFunction &gen, CanType resultType,
 /// \param cleanups - will be filled (after initialization completes)
 ///   with all the active cleanups managing the result values
 static std::unique_ptr<Initialization>
-prepareIndirectResultInit(SILGenFunction &gen, CanType formalResultType,
+prepareIndirectResultInit(SILGenFunction &SGF, CanType formalResultType,
                           SmallVectorImpl<SILValue> &directResultsBuffer,
                           SmallVectorImpl<CleanupHandle> &cleanups) {
-  auto fnConv = gen.F.getConventions();
+  auto fnConv = SGF.F.getConventions();
 
   // Make space in the direct-results array for all the entries we need.
   directResultsBuffer.append(fnConv.getNumDirectSILResults(), SILValue());
 
   ArrayRef<SILResultInfo> allResults = fnConv.funcTy->getResults();
   MutableArrayRef<SILValue> directResults = directResultsBuffer;
-  ArrayRef<SILArgument*> indirectResultAddrs = gen.F.getIndirectResults();
+  ArrayRef<SILArgument*> indirectResultAddrs = SGF.F.getIndirectResults();
 
-  auto init = prepareIndirectResultInit(gen, formalResultType, allResults,
+  auto init = prepareIndirectResultInit(SGF, formalResultType, allResults,
                                         directResults, indirectResultAddrs,
                                         cleanups);
 
@@ -368,7 +395,8 @@ void SILGenFunction::emitReturnExpr(SILLocation branchLoc,
   } else {
     // SILValue return.
     FullExpr scope(Cleanups, CleanupLocation(ret));
-    emitRValue(ret).forwardAll(*this, directResults);
+    RValue RV = emitRValue(ret).ensurePlusOne(*this, CleanupLocation(ret));
+    std::move(RV).forwardAll(*this, directResults);
   }
   Cleanups.emitBranchAndCleanups(ReturnDest, branchLoc, directResults);
 }
@@ -383,6 +411,9 @@ void StmtEmitter::visitReturnStmt(ReturnStmt *S) {
   if (!S->hasResult())
     // Void return.
     SGF.Cleanups.emitBranchAndCleanups(SGF.ReturnDest, Loc);
+  else if (S->getResult()->getType()->isUninhabited())
+    // Never return.
+    SGF.emitIgnoredExpr(S->getResult());
   else
     SGF.emitReturnExpr(Loc, S->getResult());
 }
@@ -392,6 +423,20 @@ void StmtEmitter::visitThrowStmt(ThrowStmt *S) {
   SGF.emitThrow(S, exn, /* emit a call to willThrow */ true);
 }
 
+void StmtEmitter::visitYieldStmt(YieldStmt *S) {
+  SGF.CurrentSILLoc = S;
+
+  SmallVector<ArgumentSource, 4> sources;
+  SmallVector<AbstractionPattern, 4> origTypes;
+  for (auto yield : S->getYields()) {
+    sources.emplace_back(yield);
+    origTypes.emplace_back(yield->getType());
+  }
+
+  FullExpr fullExpr(SGF.Cleanups, CleanupLocation(S));
+
+  SGF.emitYield(S, sources, origTypes, SGF.CoroutineUnwindDest);
+}
 
 namespace {
   // This is a little cleanup that ensures that there are no jumps out of a
@@ -402,7 +447,7 @@ namespace {
     SourceLoc deferLoc;
   public:
     DeferEscapeCheckerCleanup(SourceLoc deferLoc) : deferLoc(deferLoc) {}
-    void emit(SILGenFunction &SGF, CleanupLocation l) override {
+    void emit(SILGenFunction &SGF, CleanupLocation l, ForUnwind_t forUnwind) override {
       assert(false && "Sema didn't catch exit out of a defer?");
     }
     void dump(SILGenFunction &) const override {
@@ -422,7 +467,7 @@ namespace {
   public:
     DeferCleanup(SourceLoc deferLoc, Expr *call)
       : deferLoc(deferLoc), call(call) {}
-    void emit(SILGenFunction &SGF, CleanupLocation l) override {
+    void emit(SILGenFunction &SGF, CleanupLocation l, ForUnwind_t forUnwind) override {
       SGF.Cleanups.pushCleanup<DeferEscapeCheckerCleanup>(deferLoc);
       auto TheCleanup = SGF.Cleanups.getTopCleanup();
 
@@ -443,14 +488,21 @@ namespace {
 
 void StmtEmitter::visitDeferStmt(DeferStmt *S) {
   // Emit the closure for the defer, along with its binding.
-  SGF.visitFuncDecl(S->getTempDecl());
+  // If the defer is at the top-level code, insert 'mark_escape_inst'
+  // to the top-level code to check initialization of any captured globals.
+  FuncDecl *deferDecl = S->getTempDecl();
+  auto declCtxKind = deferDecl->getDeclContext()->getContextKind();
+  auto &sgm = SGF.SGM;
+  if (declCtxKind == DeclContextKind::TopLevelCodeDecl && sgm.TopLevelSGF &&
+      sgm.TopLevelSGF->B.hasValidInsertionPoint()) {
+    sgm.emitMarkFunctionEscapeForTopLevelCodeGlobals(
+        S, deferDecl->getCaptureInfo());
+  }
+  SGF.visitFuncDecl(deferDecl);
 
   // Register a cleanup to invoke the closure on any exit paths.
   SGF.Cleanups.pushCleanup<DeferCleanup>(S->getDeferLoc(), S->getCallExpr());
 }
-
-
-
 
 void StmtEmitter::visitIfStmt(IfStmt *S) {
   Scope condBufferScope(SGF.Cleanups, S);
@@ -470,7 +522,7 @@ void StmtEmitter::visitIfStmt(IfStmt *S) {
   JumpDest falseDest = contDest;
   if (S->getElseStmt())
     falseDest = createJumpDest(S);
-  
+
   // Emit the condition, along with the "then" part of the if properly guarded
   // by the condition and a jump to ContBB.  If the condition fails, jump to
   // the CondFalseBB.
@@ -478,8 +530,12 @@ void StmtEmitter::visitIfStmt(IfStmt *S) {
     // Enter a scope for any bound pattern variables.
     LexicalScope trueScope(SGF, S);
 
-    SGF.emitStmtCondition(S->getCond(), falseDest, S);
-    
+    auto NumTrueTaken = SGF.loadProfilerCount(S->getThenStmt());
+    auto NumFalseTaken = SGF.loadProfilerCount(S->getElseStmt());
+
+    SGF.emitStmtCondition(S->getCond(), falseDest, S, NumTrueTaken,
+                          NumFalseTaken);
+
     // In the success path, emit the 'then' part if the if.
     SGF.emitProfilerIncrement(S->getThenStmt());
     SGF.emitStmt(S->getThenStmt());
@@ -526,7 +582,7 @@ void StmtEmitter::visitGuardStmt(GuardStmt *S) {
     // Move the insertion point to the 'body' block temporarily and emit it.
     // Note that we don't push break/continue locations since they aren't valid
     // in this statement.
-    SavedInsertionPoint savedIP(SGF, bodyBB.getBlock());
+    SILGenSavedInsertionPoint savedIP(SGF, bodyBB.getBlock());
     SGF.emitProfilerIncrement(S->getBody());
     SGF.emitStmt(S->getBody());
 
@@ -539,13 +595,9 @@ void StmtEmitter::visitGuardStmt(GuardStmt *S) {
 
   // Emit the condition bindings, branching to the bodyBB if they fail.  Since
   // we didn't push a scope, the bound variables are live after this statement.
-  SGF.emitStmtCondition(S->getCond(), bodyBB, S);
-}
-
-
-void StmtEmitter::visitIfConfigStmt(IfConfigStmt *S) {
-  // Active members are attached to the enclosing declaration, so there's no
-  // need to walk anything within.
+  auto NumFalseTaken = SGF.loadProfilerCount(S->getBody());
+  auto NumNonTaken = SGF.loadProfilerCount(S);
+  SGF.emitStmtCondition(S->getCond(), bodyBB, S, NumNonTaken, NumFalseTaken);
 }
 
 void StmtEmitter::visitWhileStmt(WhileStmt *S) {
@@ -568,8 +620,10 @@ void StmtEmitter::visitWhileStmt(WhileStmt *S) {
   {
     // Enter a scope for any bound pattern variables.
     Scope conditionScope(SGF.Cleanups, S);
-    
-    SGF.emitStmtCondition(S->getCond(), breakDest, S);
+
+    auto NumTrueTaken = SGF.loadProfilerCount(S->getBody());
+    auto NumFalseTaken = SGF.loadProfilerCount(S);
+    SGF.emitStmtCondition(S->getCond(), breakDest, S, NumTrueTaken, NumFalseTaken);
     
     // In the success path, emit the body of the while.
     SGF.emitProfilerIncrement(S->getBody());
@@ -657,9 +711,6 @@ void StmtEmitter::visitDoCatchStmt(DoCatchStmt *S) {
     llvm::SaveAndRestore<JumpDest> savedThrowDest(SGF.ThrowDest, throwDest);
 
     visit(S->getBody());
-    // We emit the counter for exiting the do-block here, as we may not have a
-    // valid insertion point when falling out.
-    SGF.emitProfilerIncrement(S);
   }
 
   // Emit the catch clauses, but only if the body of the function
@@ -669,7 +720,7 @@ void StmtEmitter::visitDoCatchStmt(DoCatchStmt *S) {
   // has no predecessors, and SGF.ThrowDest may not be valid either.
   if (auto *BB = getOrEraseBlock(SGF, throwDest)) {
     // Move the insertion point to the throw destination.
-    SavedInsertionPoint savedIP(SGF, BB, FunctionSection::Postmatter);
+    SILGenSavedInsertionPoint savedIP(SGF, BB, FunctionSection::Postmatter);
 
     // The exception cleanup should be getting forwarded around
     // correctly anyway, but push a scope to ensure it gets popped.
@@ -721,8 +772,12 @@ void StmtEmitter::visitRepeatWhileStmt(RepeatWhileStmt *S) {
   if (SGF.B.hasValidInsertionPoint()) {
     // Evaluate the condition with the false edge leading directly
     // to the continuation block.
-    Condition Cond = SGF.emitCondition(S->getCond(), /*hasFalseCode*/ false);
-    
+    auto NumTrueTaken = SGF.loadProfilerCount(S->getBody());
+    auto NumFalseTaken = SGF.loadProfilerCount(S);
+    Condition Cond = SGF.emitCondition(S->getCond(), /*hasFalseCode*/ false,
+                                       /*invertValue*/ false, /*contArgs*/ {},
+                                       NumTrueTaken, NumFalseTaken);
+
     Cond.enterTrue(SGF);
     if (SGF.B.hasValidInsertionPoint()) {
       SGF.B.createBranch(S->getCond(), loopBB);
@@ -735,10 +790,6 @@ void StmtEmitter::visitRepeatWhileStmt(RepeatWhileStmt *S) {
   
   emitOrDeleteBlock(SGF, endDest, S);
   SGF.BreakContinueDestStack.pop_back();
-}
-
-void StmtEmitter::visitForStmt(ForStmt *S) {
-  llvm_unreachable("c-style for loop is always a semantic error");
 }
 
 void StmtEmitter::visitForEachStmt(ForEachStmt *S) {
@@ -759,7 +810,7 @@ void StmtEmitter::visitForEachStmt(ForEachStmt *S) {
   SILValue addrOnlyBuf;
   ManagedValue nextBufOrValue;
 
-  if (optTL.isAddressOnly())
+  if (optTL.isAddressOnly() && SGF.silConv.useLoweredAddresses())
     addrOnlyBuf = SGF.emitTemporaryAllocation(S, optTL.getLoweredType());
 
   // Create a new basic block and jump into it.
@@ -774,37 +825,28 @@ void StmtEmitter::visitForEachStmt(ForEachStmt *S) {
   //
   // Advance the generator.  Use a scope to ensure that any temporary stack
   // allocations in the subexpression are immediately released.
-  if (optTL.isAddressOnly()) {
-    Scope InnerForScope(SGF.Cleanups, CleanupLocation(S->getIteratorNext()));
+  if (optTL.isAddressOnly() && SGF.silConv.useLoweredAddresses()) {
+    // Create the initialization outside of the innerForScope so that the
+    // innerForScope doesn't clean it up.
     auto nextInit = SGF.useBufferAsTemporary(addrOnlyBuf, optTL);
-    SGF.emitExprInto(S->getIteratorNext(), nextInit.get());
-    nextBufOrValue =
-        ManagedValue::forUnmanaged(nextInit->getManagedAddress().forward(SGF));
-  } else {
-    // SEMANTIC SIL TODO: I am doing this to match previous behavior. We need to
-    // forward tmp below to ensure that we do not prematurely destroy the
-    // induction variable at the end of scope. I tried to use the
-    // CleanupRestorationScope and dormant, but it seemingly did not work and I
-    // do not have time to look into this now = (.
-    SILValue tmpValue;
-    bool hasCleanup;
     {
-      Scope InnerForScope(SGF.Cleanups, CleanupLocation(S->getIteratorNext()));
-      ManagedValue tmp = SGF.emitRValueAsSingleValue(S->getIteratorNext());
-      hasCleanup = tmp.hasCleanup();
-      tmpValue = tmp.forward(SGF);
+      Scope innerForScope(SGF.Cleanups, CleanupLocation(S->getIteratorNext()));
+      SGF.emitExprInto(S->getIteratorNext(), nextInit.get());
     }
-    nextBufOrValue = hasCleanup ? SGF.emitManagedRValueWithCleanup(tmpValue)
-                                : ManagedValue::forUnmanaged(tmpValue);
+    nextBufOrValue = nextInit->getManagedAddress();
+
+  } else {
+    Scope innerForScope(SGF.Cleanups, CleanupLocation(S->getIteratorNext()));
+    nextBufOrValue = innerForScope.popPreservingValue(
+        SGF.emitRValueAsSingleValue(S->getIteratorNext()));
   }
 
   SILBasicBlock *failExitingBlock = createBasicBlock();
   SwitchEnumBuilder switchEnumBuilder(SGF.B, S, nextBufOrValue);
 
-  switchEnumBuilder.addCase(
-      SGF.getASTContext().getOptionalSomeDecl(), createBasicBlock(),
-      loopDest.getBlock(),
-      [&](ManagedValue inputValue, SwitchCaseFullExpr &scope) {
+  switchEnumBuilder.addOptionalSomeCase(
+      createBasicBlock(), loopDest.getBlock(),
+      [&](ManagedValue inputValue, SwitchCaseFullExpr &&scope) {
         SGF.emitProfilerIncrement(S->getBody());
 
         // Emit the loop body.
@@ -826,15 +868,13 @@ void StmtEmitter::visitForEachStmt(ForEachStmt *S) {
           //
           // *NOTE* If we do not have an address only value, then inputValue is
           // *already properly unwrapped.
-          if (optTL.isAddressOnly()) {
-            inputValue =
-                SGF.emitManagedBufferWithCleanup(nextBufOrValue.getValue());
+          if (optTL.isAddressOnly() && SGF.silConv.useLoweredAddresses()) {
             inputValue = SGF.emitUncheckedGetOptionalValueFrom(
                 S, inputValue, optTL, SGFContext(initLoopVars.get()));
           }
 
           if (!inputValue.isInContext())
-            RValue(SGF, S, optTy.getAnyOptionalObjectType(), inputValue)
+            RValue(SGF, S, optTy.getOptionalObjectType(), inputValue)
                 .forwardInto(SGF, S, initLoopVars.get());
 
           // Now that the pattern has been initialized, check any where
@@ -855,25 +895,28 @@ void StmtEmitter::visitForEachStmt(ForEachStmt *S) {
 
         // If we emitted an unreachable in the body, we will not have a valid
         // insertion point. Just return early.
-        if (!SGF.B.hasValidInsertionPoint())
+        if (!SGF.B.hasValidInsertionPoint()) {
+          scope.unreachableExit();
           return;
+        }
 
         // Otherwise, associate the loop body's closing brace with this branch.
         RegularLocation L(S->getBody());
         L.pointToEnd();
-        scope.exit(L);
-      });
+        scope.exitAndBranch(L);
+      },
+      SGF.loadProfilerCount(S->getBody()));
 
   // We add loop fail block, just to be defensive about intermediate
   // transformations performing cleanups at scope.exit(). We still jump to the
   // contBlock.
-  switchEnumBuilder.addCase(
-      SGF.getASTContext().getOptionalNoneDecl(), createBasicBlock(),
-      failExitingBlock,
-      [&](ManagedValue inputValue, SwitchCaseFullExpr &scope) {
+  switchEnumBuilder.addOptionalNoneCase(
+      createBasicBlock(), failExitingBlock,
+      [&](ManagedValue inputValue, SwitchCaseFullExpr &&scope) {
         assert(!inputValue && "None should not be passed an argument!");
-        scope.exit(S);
-      });
+        scope.exitAndBranch(S);
+      },
+      SGF.loadProfilerCount(S));
 
   std::move(switchEnumBuilder).emit();
 
@@ -952,7 +995,7 @@ SILGenFunction::getTryApplyErrorDest(SILLocation loc,
                                            ValueOwnershipKind::Owned);
 
   assert(B.hasValidInsertionPoint() && B.insertingAtEndOfBlock());
-  SavedInsertionPoint savedIP(*this, destBB, FunctionSection::Postmatter);
+  SILGenSavedInsertionPoint savedIP(*this, destBB, FunctionSection::Postmatter);
 
   // If we're suppressing error paths, just wrap it up as unreachable
   // and return.
@@ -988,5 +1031,5 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
   }
 
   // Branch to the cleanup destination.
-  Cleanups.emitBranchAndCleanups(ThrowDest, loc, exn);
+  Cleanups.emitBranchAndCleanups(ThrowDest, loc, exn, IsForUnwind);
 }

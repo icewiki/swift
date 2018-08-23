@@ -65,6 +65,9 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
   bitcode
     Serialized LLVM `IR`.
 
+  build czar
+    Apple term for "the person assigned to watch CI this week".
+
   canonical SIL
     SIL after the
     `mandatory passes <mandatory passes / mandatory optimizations>` have run.
@@ -143,6 +146,14 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     conformances and requirements in the generic signature and not in the types
     themselves. They can be compared across declarations but cannot be used
     directly from within the context.
+
+  irrefutable pattern
+    A pattern that always matches. These patterns either bind to a variable or
+    perform structural modification, e.x.:
+
+    1. ``case _:``.
+    2. ``case let x:``.
+    3. ``case (_, _):``.
 
   IR
     1. "intermediate representation": a generic term for a format representing
@@ -304,6 +315,13 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     An implicit representation change that occurs when a value is used with
     a different `abstraction pattern` from its current representation.
 
+  refutable pattern
+    A pattern that may not always match. These include patterns such as:
+
+    1. Isa check, e.g. ``case let x as String:``.
+    2. Enum case check: e.g. ``case .none:``.
+    3. Expr pattern: e.g. ``case foo():``.
+
   resilient
     Describes a type or function where making certain changes will not break
     binary compatibility. See :doc:`LibraryEvolution.rst <LibraryEvolution>`.
@@ -321,16 +339,14 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
 
   script mode
     The parsing mode that allows top-level imperative code in a source file.
+    
+  Sema
+    Short for 'Semantic Analysis', the compiler pass that performs type checking,
+    validation, and expression rewriting before SILGen.
 
   SIL
     "Swift Intermediate Language". A high-level IR used by the Swift compiler
     for flow-sensitive diagnostics, optimization, and LLVM IR generation.
-
-  -sil-serialize-all
-    A mode where all functions in a library are made available for inlining by
-    any client, regardless of access control. Also called "magic performance
-    mode" as a reminder of how this drastically changes compilation. Not
-    guaranteed to work on arbitrary code.
 
   SR
     An issue reported on `bugs.swift.org <https://bugs.swift.org>`_. A

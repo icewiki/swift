@@ -109,7 +109,7 @@ public struct Locale : Hashable, Equatable, ReferenceConvertible {
     /// For example, in the "en" locale, the result for `.buddhist` is `"Buddhist Calendar"`.
     public func localizedString(for calendarIdentifier: Calendar.Identifier) -> String? {
         // NSLocale doesn't export a constant for this
-        let result = CFLocaleCopyDisplayNameForPropertyValue(unsafeBitCast(_wrapped, to: CFLocale.self), .calendarIdentifier, Calendar._toNSCalendarIdentifier(calendarIdentifier).rawValue as CFString) as String
+        let result = CFLocaleCopyDisplayNameForPropertyValue(unsafeBitCast(_wrapped, to: CFLocale.self), .calendarIdentifier, Calendar._toNSCalendarIdentifier(calendarIdentifier).rawValue as CFString) as String?
         return result
     }
 
@@ -481,3 +481,19 @@ extension NSLocale : _HasCustomAnyHashableRepresentation {
     }
 }
 
+extension Locale : Codable {
+    private enum CodingKeys : Int, CodingKey {
+        case identifier
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let identifier = try container.decode(String.self, forKey: .identifier)
+        self.init(identifier: identifier)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(self.identifier, forKey: .identifier)
+    }
+}

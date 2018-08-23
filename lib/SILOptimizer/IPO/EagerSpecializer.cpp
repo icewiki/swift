@@ -31,6 +31,7 @@
 #include "swift/AST/Type.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
 #include "llvm/Support/Debug.h"
 
@@ -100,12 +101,12 @@ static void addReturnValueImpl(SILBasicBlock *RetBB, SILBasicBlock *NewRetBB,
     if (NewRetVal->getType().isVoid()) {
       // Canonicalize Void return type into something that isTrivialReturnBlock
       // expects.
-      auto *TupleI = cast<SILInstruction>(RetInst->getOperand(0));
-      if (TupleI->hasOneUse()) {
-        TupleI->removeFromParent();
-        RetBB->insert(RetInst, TupleI);
+      auto *TupleI = dyn_cast<TupleInst>(RetInst->getOperand(0));
+      if (TupleI && TupleI->hasOneUse()) {
+        TupleI->moveBefore(RetInst);
       } else {
-        TupleI = TupleI->clone(RetInst);
+        Builder.setInsertionPoint(RetInst);
+        TupleI = Builder.createTuple(RetInst->getLoc(), {});
         RetInst->setOperand(0, TupleI);
       }
       MergedBB = RetBB->split(TupleI->getIterator());
@@ -153,7 +154,7 @@ emitApplyWithRethrow(SILBuilder &Builder,
                      SILLocation Loc,
                      SILValue FuncRef,
                      CanSILFunctionType CanSILFuncTy,
-                     SubstitutionList Subs,
+                     SubstitutionMap Subs,
                      ArrayRef<SILValue> CallArgs,
                      void (*EmitCleanup)(SILBuilder&, SILLocation)) {
 
@@ -163,13 +164,7 @@ emitApplyWithRethrow(SILBuilder &Builder,
   SILBasicBlock *ErrorBB = F.createBasicBlock();
   SILBasicBlock *NormalBB = F.createBasicBlock();
 
-  Builder.createTryApply(Loc,
-                         FuncRef,
-                         SILType::getPrimitiveObjectType(CanSILFuncTy),
-                         Subs,
-                         CallArgs,
-                         NormalBB,
-                         ErrorBB);
+  Builder.createTryApply(Loc, FuncRef, Subs, CallArgs, NormalBB, ErrorBB);
 
   {
     // Emit the rethrow logic.
@@ -180,7 +175,7 @@ emitApplyWithRethrow(SILBuilder &Builder,
     Builder.createBuiltin(Loc,
                           Builder.getASTContext().getIdentifier("willThrow"),
                           Builder.getModule().Types.getEmptyTupleType(),
-                          SubstitutionList(),
+                          SubstitutionMap(),
                           {Error});
 
     EmitCleanup(Builder, Loc);
@@ -209,7 +204,7 @@ emitInvocation(SILBuilder &Builder,
   auto *FuncRefInst = Builder.createFunctionRef(Loc, CalleeFunc);
   auto CanSILFuncTy = CalleeFunc->getLoweredFunctionType();
   auto CalleeSubstFnTy = CanSILFuncTy;
-  SubstitutionList Subs;
+  SubstitutionMap Subs;
   if (CanSILFuncTy->isPolymorphic()) {
     // Create a substituted callee type.
     assert(CanSILFuncTy == ReInfo.getSpecializedType() &&
@@ -234,9 +229,9 @@ emitInvocation(SILBuilder &Builder,
     // where <TS: _Trivial(64)> introduces a new archetype with the given
     // constraints.
     if (ReInfo.getSpecializedType()->isPolymorphic()) {
-      Subs = ReInfo.getCallerParamSubstitutions();
+      Subs = ReInfo.getCallerParamSubstitutionMap();
       CalleeSubstFnTy = CanSILFuncTy->substGenericArgs(
-          Builder.getModule(), ReInfo.getCallerParamSubstitutions());
+          Builder.getModule(), ReInfo.getCallerParamSubstitutionMap());
       assert(!CalleeSubstFnTy->isPolymorphic() &&
              "Substituted callee type should not be polymorphic");
       assert(!CalleeSubstFnTy->hasTypeParameter() &&
@@ -248,11 +243,22 @@ emitInvocation(SILBuilder &Builder,
   SILFunctionConventions fnConv(CalleeSILSubstFnTy.castTo<SILFunctionType>(),
                                 Builder.getModule());
 
-  if (!CanSILFuncTy->hasErrorResult()) {
-    return Builder.createApply(
-        CalleeFunc->getLocation(), FuncRefInst, CalleeSILSubstFnTy,
-        fnConv.getSILResultType(), Subs, CallArgs, false);
+  bool isNonThrowing = false;
+  // It is a function whose type claims it is throwing, but
+  // it actually never throws inside its body?
+  if (CanSILFuncTy->hasErrorResult() &&
+      CalleeFunc->findThrowBB() == CalleeFunc->end()) {
+    isNonThrowing = true;
   }
+
+  // Is callee a non-throwing function according to its type
+  // or de-facto?
+  if (!CanSILFuncTy->hasErrorResult() ||
+      CalleeFunc->findThrowBB() == CalleeFunc->end()) {
+    return Builder.createApply(CalleeFunc->getLocation(), FuncRefInst,
+                               Subs, CallArgs, isNonThrowing);
+  }
+
   return emitApplyWithRethrow(Builder, CalleeFunc->getLocation(),
                               FuncRefInst, CalleeSubstFnTy, Subs,
                               CallArgs,
@@ -324,7 +330,10 @@ protected:
 /// given specialized function. Converts call arguments. Emits an invocation of
 /// the specialized function. Handle the return value.
 void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
-  SILBasicBlock *OldReturnBB = &*GenericFunc->findReturnBB();
+  SILBasicBlock *OldReturnBB = nullptr;
+  auto ReturnBB = GenericFunc->findReturnBB();
+  if (ReturnBB != GenericFunc->end())
+      OldReturnBB = &*ReturnBB;
   // 1. Emit a cascading sequence of type checks blocks.
 
   // First split the entry BB, moving all instructions to the FailedTypeCheckBB.
@@ -337,8 +346,7 @@ void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
   // SubstitutableTypes, skipping DependentTypes.
   auto GenericSig =
     GenericFunc->getLoweredFunctionType()->getGenericSignature();
-  auto SubMap = GenericSig->getSubstitutionMap(
-    ReInfo.getClonerParamSubstitutions());
+  auto SubMap = ReInfo.getClonerParamSubstitutionMap();
   for (auto ParamTy : GenericSig->getSubstitutableParams()) {
     auto Replacement = Type(ParamTy).subst(SubMap);
     assert(!Replacement->hasTypeParameter());
@@ -346,10 +354,10 @@ void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
     if (!Replacement->hasArchetype()) {
       // Dispatch on concrete type.
       emitTypeCheck(FailedTypeCheckBB, ParamTy, Replacement);
-    } else {
+    } else if (auto Archetype = Replacement->getAs<ArchetypeType>()) {
       // If Replacement has a layout constraint, then dispatch based
       // on its size and the fact that it is trivial.
-      auto LayoutInfo = Replacement->getLayoutConstraint();
+      auto LayoutInfo = Archetype->getLayoutConstraint();
       if (LayoutInfo && LayoutInfo->isTrivial()) {
         // Emit a check that it is a trivial type of a certain size.
         emitTrivialAndSizeCheck(FailedTypeCheckBB, ParamTy,
@@ -395,7 +403,7 @@ void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
     Result = Builder.createTuple(Loc, VoidTy, { });
 
   // Function marked as @NoReturn must be followed by 'unreachable'.
-  if (NewFunc->isNoReturnFunction())
+  if (NewFunc->isNoReturnFunction() || !OldReturnBB)
     Builder.createUnreachable(Loc);
   else {
     auto resultTy = GenericFunc->getConventions().getSILResultType();
@@ -450,6 +458,14 @@ emitTypeCheck(SILBasicBlock *FailedTypeCheckBB, SubstitutableType *ParamTy,
   Builder.emitBlock(SuccessBB);
 }
 
+static SubstitutionMap getSingleSubstititutionMap(SILFunction *F,
+                                                  Type Ty) {
+  return SubstitutionMap::get(
+    F->getGenericEnvironment()->getGenericSignature(),
+    [&](SubstitutableType *type) { return Ty; },
+    MakeAbstractConformanceForGenericType());
+}
+
 void EagerDispatch::emitIsTrivialCheck(SILBasicBlock *FailedTypeCheckBB,
                                        SubstitutableType *ParamTy, Type SubTy,
                                        LayoutConstraint Layout) {
@@ -459,11 +475,11 @@ void EagerDispatch::emitIsTrivialCheck(SILBasicBlock *FailedTypeCheckBB,
   auto GenericMT = Builder.createMetatype(
       Loc, getThickMetatypeType(ContextTy->getCanonicalType()));
   auto BoolTy = SILType::getBuiltinIntegerType(1, Ctx);
-  Substitution Sub(ContextTy, {});
+  SubstitutionMap SubMap = getSingleSubstititutionMap(GenericFunc, ContextTy);
 
   // Emit a check that it is a pod object.
   auto IsPOD = Builder.createBuiltin(Loc, Ctx.getIdentifier("ispod"), BoolTy,
-                                     Sub, {GenericMT});
+                                     SubMap, {GenericMT});
   auto *SuccessBB = Builder.getFunction().createBasicBlock();
   Builder.createCondBranch(Loc, IsPOD, SuccessBB, FailedTypeCheckBB);
   Builder.emitBlock(SuccessBB);
@@ -485,9 +501,9 @@ void EagerDispatch::emitTrivialAndSizeCheck(SILBasicBlock *FailedTypeCheckBB,
 
   auto WordTy = SILType::getBuiltinWordType(Ctx);
   auto BoolTy = SILType::getBuiltinIntegerType(1, Ctx);
-  Substitution Sub(ContextTy, {});
+  SubstitutionMap SubMap = getSingleSubstititutionMap(GenericFunc, ContextTy);
   auto ParamSize = Builder.createBuiltin(Loc, Ctx.getIdentifier("sizeof"),
-                                         WordTy, Sub, { GenericMT });
+                                         WordTy, SubMap, { GenericMT });
   auto LayoutSize =
       Builder.createIntegerLiteral(Loc, WordTy, Layout->getTrivialSizeInBytes());
   const char *CmpOpName = Layout->isFixedSizeTrivial() ? "cmp_eq" : "cmp_le";
@@ -502,7 +518,7 @@ void EagerDispatch::emitTrivialAndSizeCheck(SILBasicBlock *FailedTypeCheckBB,
   // Emit a check that it is a pod object.
   // TODO: Perform this check before all the fixed size checks!
   auto IsPOD = Builder.createBuiltin(Loc, Ctx.getIdentifier("ispod"),
-                                         BoolTy, Sub, { GenericMT });
+                                         BoolTy, SubMap, { GenericMT });
   auto *SuccessBB2 = Builder.getFunction().createBasicBlock();
   Builder.createCondBranch(Loc, IsPOD, SuccessBB2, FailedTypeCheckBB);
   Builder.emitBlock(SuccessBB2);
@@ -520,13 +536,13 @@ void EagerDispatch::emitRefCountedObjectCheck(SILBasicBlock *FailedTypeCheckBB,
 
   auto Int8Ty = SILType::getBuiltinIntegerType(8, Ctx);
   auto BoolTy = SILType::getBuiltinIntegerType(1, Ctx);
-  Substitution Sub(ContextTy, {});
+  SubstitutionMap SubMap = getSingleSubstititutionMap(GenericFunc, ContextTy);
 
   // Emit a check that it is a reference-counted object.
   // TODO: Perform this check before all fixed size checks.
   // FIXME: What builtin do we use to check it????
   auto CanBeClass = Builder.createBuiltin(
-      Loc, Ctx.getIdentifier("canBeClass"), Int8Ty, Sub, {GenericMT});
+      Loc, Ctx.getIdentifier("canBeClass"), Int8Ty, SubMap, {GenericMT});
   auto ClassConst =
       Builder.createIntegerLiteral(Loc, Int8Ty, 1);
   auto Cmp1 =
@@ -535,11 +551,11 @@ void EagerDispatch::emitRefCountedObjectCheck(SILBasicBlock *FailedTypeCheckBB,
                                         {CanBeClass, ClassConst});
 
   auto *SuccessBB = Builder.getFunction().createBasicBlock();
-  auto *MayBeCalssCheckBB = Builder.getFunction().createBasicBlock();
+  auto *MayBeCallsCheckBB = Builder.getFunction().createBasicBlock();
   Builder.createCondBranch(Loc, Cmp1, SuccessBB,
-                           MayBeCalssCheckBB);
+                           MayBeCallsCheckBB);
 
-  Builder.emitBlock(MayBeCalssCheckBB);
+  Builder.emitBlock(MayBeCallsCheckBB);
 
   auto MayBeClassConst =
       Builder.createIntegerLiteral(Loc, Int8Ty, 2);
@@ -555,14 +571,9 @@ void EagerDispatch::emitRefCountedObjectCheck(SILBasicBlock *FailedTypeCheckBB,
   Builder.emitBlock(IsClassCheckBB);
 
   auto *FRI = Builder.createFunctionRef(Loc, IsClassF);
-  auto CanFnTy = IsClassF->getLoweredFunctionType()->substGenericArgs(
-      Builder.getModule(), {Sub});
-  auto SILFnTy = SILType::getPrimitiveObjectType(CanFnTy);
-  SILFunctionConventions fnConv(CanFnTy, Builder.getModule());
-  auto SILResultTy = fnConv.getSILResultType();
-  auto IsClassRuntimeCheck =
-      Builder.createApply(Loc, FRI, SILFnTy, SILResultTy, {Sub}, {GenericMT},
-                          /* isNonThrowing */ false);
+  auto IsClassRuntimeCheck = Builder.createApply(Loc, FRI, SubMap,
+                                                 {GenericMT},
+                                                 /* isNonThrowing */ false);
   // Extract the i1 from the Bool struct.
   StructDecl *BoolStruct = cast<StructDecl>(Ctx.getBoolDecl());
   auto Members = BoolStruct->lookupDirect(Ctx.Id_value_);
@@ -614,7 +625,7 @@ emitArgumentConversion(SmallVectorImpl<SILValue> &CallArgs) {
   auto CalleeSubstFnTy = CanSILFuncTy;
   if (CanSILFuncTy->isPolymorphic()) {
     CalleeSubstFnTy = CanSILFuncTy->substGenericArgs(
-        Builder.getModule(), ReInfo.getCallerParamSubstitutions());
+        Builder.getModule(), ReInfo.getCallerParamSubstitutionMap());
     assert(!CalleeSubstFnTy->isPolymorphic() &&
            "Substituted callee type should not be polymorphic");
     assert(!CalleeSubstFnTy->hasTypeParameter() &&
@@ -625,7 +636,9 @@ emitArgumentConversion(SmallVectorImpl<SILValue> &CallArgs) {
         ReInfo.createSpecializedType(SubstitutedType, Builder.getModule());
   }
 
-  assert(OrigArgs.size() == ReInfo.getNumArguments() && "signature mismatch");
+  assert(!substConv.useLoweredAddresses()
+         || OrigArgs.size() == ReInfo.getNumArguments() &&
+         "signature mismatch");
 
   CallArgs.reserve(OrigArgs.size());
   SILValue StoreResultTo;
@@ -633,7 +646,7 @@ emitArgumentConversion(SmallVectorImpl<SILValue> &CallArgs) {
     unsigned ArgIdx = OrigArg->getIndex();
 
     auto CastArg = emitArgumentCast(SubstitutedType, OrigArg, ArgIdx);
-    DEBUG(dbgs() << "  Cast generic arg: "; CastArg->print(dbgs()));
+    LLVM_DEBUG(dbgs() << "  Cast generic arg: "; CastArg->print(dbgs()));
 
     if (!substConv.useLoweredAddresses()) {
       CallArgs.push_back(CastArg);
@@ -685,31 +698,37 @@ public:
 
   void run() override;
 
-  StringRef getName() override { return "Eager Specializer"; }
 };
 } // end anonymous namespace
 
 /// Specializes a generic function for a concrete type list.
-static SILFunction *eagerSpecialize(SILFunction *GenericFunc,
+static SILFunction *eagerSpecialize(SILOptFunctionBuilder &FuncBuilder,
+                                    SILFunction *GenericFunc,
                                     const SILSpecializeAttr &SA,
                                     const ReabstractionInfo &ReInfo) {
-  DEBUG(dbgs() << "Specializing " << GenericFunc->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "Specializing " << GenericFunc->getName() << "\n");
 
-  DEBUG(auto FT = GenericFunc->getLoweredFunctionType();
-        dbgs() << "  Generic Sig:";
-        dbgs().indent(2); FT->getGenericSignature()->print(dbgs());
-        dbgs() << "  Generic Env:";
-        dbgs().indent(2); GenericFunc->getGenericEnvironment()->dump(dbgs());
-        dbgs() << "  Specialize Attr:";
-        SA.print(dbgs()); dbgs() << "\n");
+  LLVM_DEBUG(auto FT = GenericFunc->getLoweredFunctionType();
+             dbgs() << "  Generic Sig:";
+             dbgs().indent(2); FT->getGenericSignature()->print(dbgs());
+             dbgs() << "  Generic Env:";
+             dbgs().indent(2);
+             GenericFunc->getGenericEnvironment()->dump(dbgs());
+             dbgs() << "  Specialize Attr:";
+             SA.print(dbgs()); dbgs() << "\n");
+
+  IsSerialized_t Serialized = IsNotSerialized;
+  if (GenericFunc->isSerialized())
+    Serialized = IsSerializable;
 
   GenericFuncSpecializer
-        FuncSpecializer(GenericFunc, ReInfo.getClonerParamSubstitutions(),
-                        GenericFunc->isFragile(), ReInfo);
+      FuncSpecializer(FuncBuilder, GenericFunc,
+                      ReInfo.getClonerParamSubstitutionMap(),
+                      Serialized, ReInfo);
 
   SILFunction *NewFunc = FuncSpecializer.trySpecialization();
   if (!NewFunc)
-    DEBUG(dbgs() << "  Failed. Cannot specialize function.\n");
+    LLVM_DEBUG(dbgs() << "  Failed. Cannot specialize function.\n");
   return NewFunc;
 }
 
@@ -718,11 +737,13 @@ void EagerSpecializerTransform::run() {
   if (!EagerSpecializeFlag)
     return;
 
+  SILOptFunctionBuilder FuncBuilder(*this);
+
   // Process functions in any order.
   for (auto &F : *getModule()) {
     if (!F.shouldOptimize()) {
-      DEBUG(dbgs() << "  Cannot specialize function " << F.getName()
-                   << " marked to be excluded from optimizations.\n");
+      LLVM_DEBUG(dbgs() << "  Cannot specialize function " << F.getName()
+                        << " marked to be excluded from optimizations.\n");
       continue;
     }
     // Only specialize functions in their home module.
@@ -742,13 +763,12 @@ void EagerSpecializerTransform::run() {
     for (auto *SA : F.getSpecializeAttrs()) {
       auto AttrRequirements = SA->getRequirements();
       ReInfoVec.emplace_back(&F, AttrRequirements);
-      auto *NewFunc = eagerSpecialize(&F, *SA, ReInfoVec.back());
-      notifyAddFunction(NewFunc);
+      auto *NewFunc = eagerSpecialize(FuncBuilder, &F, *SA, ReInfoVec.back());
 
       SpecializedFuncs.push_back(NewFunc);
 
       if (SA->isExported()) {
-        NewFunc->setKeepAsPublic(true);
+        NewFunc->setLinkage(SILLinkage::Public);
         continue;
       }
     }

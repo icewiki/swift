@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/STLExtras.h"
+#include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILArgument.h"
@@ -28,12 +29,15 @@ using namespace swift;
 // SILBasicBlock Implementation
 //===----------------------------------------------------------------------===//
 
-SILBasicBlock::SILBasicBlock(SILFunction *parent, SILBasicBlock *afterBB)
+SILBasicBlock::SILBasicBlock(SILFunction *parent, SILBasicBlock *relativeToBB,
+                             bool after)
     : Parent(parent), PredList(nullptr) {
-  if (afterBB) {
-    parent->getBlocks().insertAfter(afterBB->getIterator(), this);
-  } else {
+  if (!relativeToBB) {
     parent->getBlocks().push_back(this);
+  } else if (after) {
+    parent->getBlocks().insertAfter(relativeToBB->getIterator(), this);
+  } else {
+    parent->getBlocks().insert(relativeToBB->getIterator(), this);
   }
 }
 SILBasicBlock::~SILBasicBlock() {
@@ -44,13 +48,18 @@ SILBasicBlock::~SILBasicBlock() {
 
   dropAllReferences();
 
-  // Notify the delete handlers that the instructions in this block are
-  // being deleted.
-  auto &M = getModule();
+  SILModule *M = nullptr;
+  if (getParent())
+    M = &getParent()->getModule();
+
   for (auto I = begin(), E = end(); I != E;) {
     auto Inst = &*I;
     ++I;
-    M.notifyDeleteHandlers(Inst);
+    if (M) {
+      // Notify the delete handlers that the instructions in this block are
+      // being deleted.
+      M->notifyDeleteHandlers(Inst);
+    }
     erase(Inst);
   }
 
@@ -58,7 +67,7 @@ SILBasicBlock::~SILBasicBlock() {
   InstList.clearAndLeakNodesUnsafely();
 }
 
-int SILBasicBlock::getDebugID() {
+int SILBasicBlock::getDebugID() const {
   if (!getParent())
     return -1;
   int idx = 0;
@@ -90,12 +99,22 @@ void SILBasicBlock::remove(SILInstruction *I) {
   InstList.remove(I);
 }
 
-void SILBasicBlock::erase(SILInstruction *I) {
+void SILBasicBlock::eraseInstructions() {
+ for (auto It = begin(); It != end();) {
+    auto *Inst = &*It++;
+    Inst->replaceAllUsesOfAllResultsWithUndef();
+    Inst->eraseFromParent();
+  }
+}
+
+/// Returns the iterator following the erased instruction.
+SILBasicBlock::iterator SILBasicBlock::erase(SILInstruction *I) {
   // Notify the delete handlers that this instruction is going away.
   getModule().notifyDeleteHandlers(&*I);
   auto *F = getParent();
-  InstList.erase(I);
+  auto nextIter = InstList.erase(I);
   F->getModule().deallocateInst(I);
+  return nextIter;
 }
 
 /// This method unlinks 'self' from the containing SILFunction and deletes it.
@@ -222,11 +241,8 @@ void SILBasicBlock::eraseArgument(int Index) {
 /// stay as part of the original basic block. The old basic block is left
 /// without a terminator.
 SILBasicBlock *SILBasicBlock::split(iterator I) {
-  SILBasicBlock *New = new (Parent->getModule()) SILBasicBlock(Parent);
-  SILFunction::iterator Where = std::next(SILFunction::iterator(this));
-  SILFunction::iterator First = SILFunction::iterator(New);
-  if (Where != First)
-    Parent->getBlocks().splice(Where, Parent->getBlocks(), First);
+  SILBasicBlock *New =
+    new (Parent->getModule()) SILBasicBlock(Parent, this, /*after*/true);
   // Move all of the specified instructions from the original basic block into
   // the new basic block.
   New->InstList.splice(New->end(), InstList, I, end());
@@ -240,6 +256,14 @@ void SILBasicBlock::moveAfter(SILBasicBlock *After) {
   auto InsertPt = std::next(SILFunction::iterator(After));
   auto &BlkList = getParent()->getBlocks();
   BlkList.splice(InsertPt, BlkList, this);
+}
+
+void SILBasicBlock::moveTo(SILBasicBlock::iterator To, SILInstruction *I) {
+  assert(I->getParent() != this && "Must move from different basic block");
+  InstList.splice(To, I->getParent()->InstList, I);
+  ScopeCloner ScopeCloner(*Parent);
+  SILBuilder B(*Parent);
+  I->setDebugScope(B, ScopeCloner.getOrCreateClonedScope(I->getDebugScope()));
 }
 
 void
@@ -312,20 +336,18 @@ bool SILBasicBlock::isEntry() const {
 }
 
 SILBasicBlock::PHIArgumentArrayRefTy SILBasicBlock::getPHIArguments() const {
-  using FuncTy = std::function<SILPHIArgument *(SILArgument *)>;
-  FuncTy F = [](SILArgument *A) -> SILPHIArgument * {
+  return PHIArgumentArrayRefTy(getArguments(),
+                               [](SILArgument *A) -> SILPHIArgument * {
     return cast<SILPHIArgument>(A);
-  };
-  return makeTransformArrayRef(getArguments(), F);
+  });
 }
 
 SILBasicBlock::FunctionArgumentArrayRefTy
 SILBasicBlock::getFunctionArguments() const {
-  using FuncTy = std::function<SILFunctionArgument *(SILArgument *)>;
-  FuncTy F = [](SILArgument *A) -> SILFunctionArgument * {
+  return FunctionArgumentArrayRefTy(getArguments(),
+                                    [](SILArgument *A) -> SILFunctionArgument* {
     return cast<SILFunctionArgument>(A);
-  };
-  return makeTransformArrayRef(getArguments(), F);
+  });
 }
 
 /// Returns true if this block ends in an unreachable or an apply of a
@@ -345,4 +367,22 @@ bool SILBasicBlock::isNoReturn() const {
   }
 
   return false;
+}
+
+bool SILBasicBlock::isTrampoline() const {
+  auto *Branch = dyn_cast<BranchInst>(getTerminator());
+  if (!Branch)
+    return false;
+  return begin() == Branch->getIterator();
+}
+
+bool SILBasicBlock::isLegalToHoistInto() const {
+  return true;
+}
+
+const SILDebugScope *SILBasicBlock::getScopeOfFirstNonMetaInstruction() {
+  for (auto &Inst : *this)
+    if (Inst.isMetaInstruction())
+      return Inst.getDebugScope();
+  return begin()->getDebugScope();
 }

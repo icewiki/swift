@@ -6,13 +6,13 @@ from __future__ import print_function
 
 import os
 import re
+import sys
 try:
     from cStringIO import StringIO
 except ImportError:
     from io import StringIO
 import textwrap
 import tokenize
-
 from bisect import bisect
 
 try:
@@ -550,7 +550,8 @@ class ParseContext(object):
         self.token_kind = None
 
 
-_default_line_directive = '// ###sourceLocation'
+_default_line_directive = \
+    '// ###sourceLocation(file: "%(file)s", line: %(line)d)'
 
 
 class ExecutionContext(object):
@@ -572,8 +573,11 @@ class ExecutionContext(object):
                 # We can only insert the line directive at a line break
                 if len(self.result_text) == 0 \
                    or self.result_text[-1].endswith('\n'):
-                    self.result_text.append('%s(file: "%s", line: %d)\n' % (
-                        self.line_directive, file, line + 1))
+                    if sys.platform == 'win32':
+                        file = file.replace('\\', '/')
+                    substitutions = {'file': file, 'line': line + 1}
+                    format_str = self.line_directive + '\n'
+                    self.result_text.append(format_str % substitutions)
                 # But if the new text contains any line breaks, we can create
                 # one
                 elif '\n' in text:
@@ -751,7 +755,11 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     local bindings.
 
     >>> from tempfile import NamedTemporaryFile
-    >>> f = NamedTemporaryFile()
+    >>> # On Windows, the name of a NamedTemporaryFile cannot be used to open
+    >>> # the file for a second time if delete=True. Therefore, we have to
+    >>> # manually handle closing and deleting this file to allow us to open
+    >>> # the file by its name across all platforms.
+    >>> f = NamedTemporaryFile(delete=False)
     >>> f.write(
     ... r'''---
     ... % for i in range(int(x)):
@@ -766,7 +774,10 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     ... ''')
     >>> f.flush()
     >>> result = expand(
-    ...   f.name, line_directive='//#sourceLocation', x=2
+    ...     f.name,
+    ...     line_directive='//#sourceLocation(file: "%(file)s", ' + \
+    ...                    'line: %(line)d)',
+    ...     x=2
     ... ).replace(
     ...   '"%s"' % f.name, '"dummy.file"')
     >>> print(result, end='')
@@ -786,6 +797,8 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     y
     //#sourceLocation(file: "dummy.file", line: 10)
     z
+    >>> f.close()
+    >>> os.remove(f.name)
     """
     with open(filename) as f:
         t = parse_template(filename, f.read())
@@ -1064,7 +1077,9 @@ def execute_template(
     ... % else:
     ... THIS SHOULD NOT APPEAR IN THE OUTPUT
     ... ''')
-    >>> out = execute_template(ast, line_directive='//#sourceLocation', x=1)
+    >>> out = execute_template(ast,
+    ... line_directive='//#sourceLocation(file: "%(file)s", line: %(line)d)',
+    ... x=1)
     >>> out = out.replace(file_name, "DUMMY-FILE")
     >>> print(out, end="")
     //#sourceLocation(file: "DUMMY-FILE", line: 1)
@@ -1084,12 +1099,31 @@ def execute_template(
     ... % end
     ... ${a}
     ... ''')
-    >>> out = execute_template(ast, line_directive='//#sourceLocation', x=1)
+    >>> out = execute_template(ast,
+    ... line_directive='//#sourceLocation(file: "%(file)s", line: %(line)d)',
+    ... x=1)
     >>> out = out.replace(file_name, "DUMMY-FILE")
     >>> print(out, end="")
     //#sourceLocation(file: "DUMMY-FILE", line: 1)
     Nothing
     //#sourceLocation(file: "DUMMY-FILE", line: 6)
+    [0, 1, 2]
+
+    >>> ast = parse_template(file_name, text=
+    ... '''Nothing
+    ... % a = []
+    ... % for x in range(3):
+    ... %    a.append(x)
+    ... % end
+    ... ${a}
+    ... ''')
+    >>> out = execute_template(ast,
+    ...         line_directive='#line %(line)d "%(file)s"', x=1)
+    >>> out = out.replace(file_name, "DUMMY-FILE")
+    >>> print(out, end="")
+    #line 1 "DUMMY-FILE"
+    Nothing
+    #line 6 "DUMMY-FILE"
     [0, 1, 2]
     """
     execution_context = ExecutionContext(
@@ -1102,7 +1136,7 @@ def main():
     """
     Lint this file.
     >>> import sys
-    >>> gyb_path = os.path.realpath(__file__)
+    >>> gyb_path = os.path.realpath(__file__).replace('.pyc', '.py')
     >>> sys.path.append(os.path.dirname(gyb_path))
     >>> import python_lint
     >>> python_lint.lint([gyb_path], verbose=False)
@@ -1197,8 +1231,14 @@ def main():
         '--dump', action='store_true',
         default=False, help='Dump the parsed template to stdout')
     parser.add_argument(
-        '--line-directive', default='// ###sourceLocation',
-        help='Line directive prefix; empty => no line markers')
+        '--line-directive',
+        default=_default_line_directive,
+        help='''
+             Line directive format string, which will be
+             provided 2 substitutions, `%%(line)d` and `%%(file)s`.
+
+             Example: `// #sourceLocation(file: "%%(file)s", line: %%(line)d)`
+             ''')
 
     args = parser.parse_args(sys.argv[1:])
 

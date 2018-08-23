@@ -21,13 +21,17 @@
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 
+#include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
-#include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
+#include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
+#include "swift/SILOptimizer/Analysis/ProtocolConformanceAnalysis.h"
+#include "swift/SILOptimizer/Utils/CastOptimizer.h"
+#include "swift/SILOptimizer/Utils/Existential.h"
 #include "swift/SILOptimizer/Utils/Local.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace swift {
 
@@ -51,10 +55,8 @@ public:
 
   /// If the given ValueBase is a SILInstruction add it to the worklist.
   void addValue(ValueBase *V) {
-    auto *I = dyn_cast<SILInstruction>(V);
-    if (!I)
-      return;
-    add(I);
+    if (auto *I = V->getDefiningInstruction())
+      add(I);
   }
 
   /// Add the given list of instructions in reverse order to the worklist. This
@@ -82,11 +84,20 @@ public:
   }
 
   /// When an instruction has been simplified, add all of its users to the
-  /// worklist since additional simplifications of its users may have been
+  /// worklist, since additional simplifications of its users may have been
   /// exposed.
   void addUsersToWorklist(ValueBase *I) {
     for (auto UI : I->getUses())
       add(UI->getUser());
+  }
+
+  /// When an instruction has been simplified, add all of its users to the
+  /// worklist, since additional simplifications of its users may have been
+  /// exposed.
+  void addUsersOfAllResultsToWorklist(SILInstruction *I) {
+    for (auto result : I->getResults()) {
+      addUsersToWorklist(result);
+    }
   }
 
   /// Check that the worklist is empty and nuke the backing store for the map if
@@ -107,6 +118,16 @@ class SILCombiner :
 
   AliasAnalysis *AA;
 
+  DominanceAnalysis *DA;
+
+  // Determine the set of types a protocol conforms to in whole-module
+  // compilation mode.
+  ProtocolConformanceAnalysis *PCA;
+
+  // Class hierarchy analysis needed to confirm no derived classes of a sole
+  // conforming class.
+  ClassHierarchyAnalysis *CHA;
+
   /// Worklist containing all of the instructions primed for simplification.
   SILCombineWorklist Worklist;
 
@@ -126,11 +147,15 @@ class SILCombiner :
   CastOptimizer CastOpt;
 
 public:
-  SILCombiner(SILBuilder &B, AliasAnalysis *AA, bool removeCondFails)
-      : AA(AA), Worklist(), MadeChange(false), RemoveCondFails(removeCondFails),
-        Iteration(0), Builder(B),
-        CastOpt(/* ReplaceInstUsesAction */
-                [&](SILInstruction *I, ValueBase * V) {
+  SILCombiner(SILOptFunctionBuilder &FuncBuilder,
+              SILBuilder &B, AliasAnalysis *AA, DominanceAnalysis *DA,
+              ProtocolConformanceAnalysis *PCA, ClassHierarchyAnalysis *CHA,
+              bool removeCondFails)
+      : AA(AA), DA(DA), PCA(PCA), CHA(CHA), Worklist(), MadeChange(false),
+        RemoveCondFails(removeCondFails), Iteration(0), Builder(B),
+        CastOpt(FuncBuilder,
+                /* ReplaceInstUsesAction */
+                [&](SingleValueInstruction *I, ValueBase *V) {
                   replaceInstUsesWith(*I, V);
                 },
                 /* EraseAction */
@@ -152,7 +177,9 @@ public:
   // replaceable with another preexisting expression. Here we add all uses of I
   // to the worklist, replace all uses of I with the new value, then return I,
   // so that the combiner will know that I was modified.
-  SILInstruction *replaceInstUsesWith(SILInstruction &I, ValueBase *V);
+  void replaceInstUsesWith(SingleValueInstruction &I, ValueBase *V);
+
+  void replaceInstUsesPairwiseWith(SILInstruction *oldI, SILInstruction *newI);
 
   // Some instructions can never be "trivially dead" due to side effects or
   // producing a void value. In those cases, since we cannot rely on
@@ -175,20 +202,25 @@ public:
   }
 
   /// Base visitor that does not do anything.
-  SILInstruction *visitValueBase(ValueBase *V) { return nullptr; }
+  SILInstruction *visitSILInstruction(SILInstruction *I) { return nullptr; }
 
   /// Instruction visitors.
   SILInstruction *visitReleaseValueInst(ReleaseValueInst *DI);
   SILInstruction *visitRetainValueInst(RetainValueInst *CI);
+  SILInstruction *visitReleaseValueAddrInst(ReleaseValueAddrInst *DI);
+  SILInstruction *visitRetainValueAddrInst(RetainValueAddrInst *CI);
   SILInstruction *visitPartialApplyInst(PartialApplyInst *AI);
   SILInstruction *visitApplyInst(ApplyInst *AI);
   SILInstruction *visitTryApplyInst(TryApplyInst *AI);
+  SILInstruction *optimizeStringObject(BuiltinInst *BI);
   SILInstruction *visitBuiltinInst(BuiltinInst *BI);
   SILInstruction *visitCondFailInst(CondFailInst *CFI);
   SILInstruction *visitStrongRetainInst(StrongRetainInst *SRI);
   SILInstruction *visitRefToRawPointerInst(RefToRawPointerInst *RRPI);
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
+  SILInstruction *optimizeLoadFromStringLiteral(LoadInst *LI);
   SILInstruction *visitLoadInst(LoadInst *LI);
+  SILInstruction *visitIndexAddrInst(IndexAddrInst *IA);
   SILInstruction *visitAllocStackInst(AllocStackInst *AS);
   SILInstruction *visitAllocRefInst(AllocRefInst *AR);
   SILInstruction *visitSwitchEnumAddrInst(SwitchEnumAddrInst *SEAI);
@@ -197,6 +229,7 @@ public:
   SILInstruction *visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI);
   SILInstruction *visitUncheckedRefCastInst(UncheckedRefCastInst *URCI);
   SILInstruction *visitUncheckedRefCastAddrInst(UncheckedRefCastAddrInst *URCI);
+  SILInstruction *visitBridgeObjectToRefInst(BridgeObjectToRefInst *BORI);
   SILInstruction *visitUnconditionalCheckedCastInst(
                     UnconditionalCheckedCastInst *UCCI);
   SILInstruction *
@@ -226,7 +259,12 @@ public:
   SILInstruction *visitUnreachableInst(UnreachableInst *UI);
   SILInstruction *visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI);
   SILInstruction *visitEnumInst(EnumInst *EI);
+      
+  SILInstruction *visitMarkDependenceInst(MarkDependenceInst *MDI);
+  SILInstruction *visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *CBOI);
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
+  SILInstruction *
+  visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *Cvt);
 
   /// Instruction visitor helpers.
   SILInstruction *optimizeBuiltinCanBeObjCClass(BuiltinInst *AI);
@@ -255,21 +293,27 @@ public:
                                        StringRef FInverseName, StringRef FName);
 
 private:
-  SILInstruction * createApplyWithConcreteType(FullApplySite AI,
-                                               SILValue NewSelf,
-                                               SILValue Self,
-                                               CanType ConcreteType,
-                                               SILValue ConcreteTypeDef,
-                                               ProtocolConformanceRef Conformance,
-                                               ArchetypeType *OpenedArchetype);
-  SILInstruction *
-  propagateConcreteTypeOfInitExistential(FullApplySite AI,
-      ProtocolDecl *Protocol,
-      llvm::function_ref<void(CanType, ProtocolConformanceRef)> Propagate);
+  FullApplySite rewriteApplyCallee(FullApplySite apply, SILValue callee);
 
-  SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite AI,
-                                                         WitnessMethodInst *WMI);
-  SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite AI);
+  SILInstruction *createApplyWithConcreteType(FullApplySite Apply,
+                                              const ConcreteExistentialInfo &CEI,
+                                              SILBuilderContext &BuilderCtx);
+
+  // Common utility function to replace the WitnessMethodInst using a
+  // BuilderCtx.
+  void replaceWitnessMethodInst(WitnessMethodInst *WMI,
+                                SILBuilderContext &BuilderCtx,
+                                CanType ConcreteType,
+                                const ProtocolConformanceRef ConformanceRef);
+
+  SILInstruction *
+  propagateConcreteTypeOfInitExistential(FullApplySite Apply,
+                                         WitnessMethodInst *WMI);
+  SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite Apply);
+
+  /// Propagate concrete types from ProtocolConformanceAnalysis.
+  SILInstruction *propagateSoleConformingType(FullApplySite Apply,
+                                              WitnessMethodInst *WMI);
 
   /// Perform one SILCombine iteration.
   bool doOneIteration(SILFunction &F, unsigned Iteration);

@@ -81,14 +81,22 @@ func test8(_ x : AnyObject?) {
 
 
 // Partial ordering with optionals
-func test9_helper<T>(_ x: T) -> Int { }
-func test9_helper<T>(_ x: T?) -> Double { }
+func test9_helper<T: P>(_ x: T) -> Int { }
+func test9_helper<T: P>(_ x: T?) -> Double { }
+
+func test9_helper2<T>(_ x: T) -> Int { }
+func test9_helper2<T>(_ x: T?) -> Double { }
 
 func test9(_ i: Int, io: Int?) {
   let result = test9_helper(i)
   var _: Int = result
   let result2 = test9_helper(io)
   let _: Double = result2
+
+  let result3 = test9_helper2(i)
+  var _: Int = result3
+  let result4 = test9_helper2(io)
+  let _: Double = result4
 }
 
 protocol P { }
@@ -120,7 +128,12 @@ func testVoidOptional() {
   voidOptional(optNoop)
 }
 
-func testTernaryWithNil(b: Bool, s: String, i: Int) {
+protocol Proto1 {}
+protocol Proto2 {}
+struct Nilable: ExpressibleByNilLiteral {
+	init(nilLiteral: ()) {}
+}
+func testTernaryWithNil<T>(b: Bool, s: String, i: Int, a: Any, t: T, m: T.Type, p: Proto1 & Proto2, arr: [Int], opt: Int?, iou: Int!, n: Nilable) {
   let t1 = b ? s : nil
   let _: Double = t1 // expected-error{{value of type 'String?'}}
   let t2 = b ? nil : i
@@ -129,6 +142,50 @@ func testTernaryWithNil(b: Bool, s: String, i: Int) {
   let _: Double = t3 // expected-error{{value of type 'String?'}}
   let t4 = b ? nil : 1
   let _: Double = t4 // expected-error{{value of type 'Int?'}}
+  let t5 = b ? (s, i) : nil
+  let _: Double = t5 // expected-error{{value of type '(String, Int)?}}
+  let t6 = b ? nil : (i, s)
+  let _: Double = t6 // expected-error{{value of type '(Int, String)?}}
+  let t7 = b ? ("hello", 1) : nil
+  let _: Double = t7 // expected-error{{value of type '(String, Int)?}}
+  let t8 = b ? nil : (1, "hello")
+  let _: Double = t8 // expected-error{{value of type '(Int, String)?}}
+  let t9 = b ? { $0 * 2 } : nil
+  let _: Double = t9 // expected-error{{value of type '((Int) -> Int)?}}
+  let t10 = b ? nil : { $0 * 2 }
+  let _: Double = t10 // expected-error{{value of type '((Int) -> Int)?}}
+  let t11 = b ? a : nil
+  let _: Double = t11 // expected-error{{value of type 'Any?'}}
+  let t12 = b ? nil : a
+  let _: Double = t12 // expected-error{{value of type 'Any?'}}
+  let t13 = b ? t : nil
+  let _: Double = t13 // expected-error{{value of type 'T?'}}
+  let t14 = b ? nil : t
+  let _: Double = t14 // expected-error{{value of type 'T?'}}
+  let t15 = b ? m : nil
+  let _: Double = t15 // expected-error{{value of type 'T.Type?'}}
+  let t16 = b ? nil : m
+  let _: Double = t16 // expected-error{{value of type 'T.Type?'}}
+  let t17 = b ? p : nil
+  let _: Double = t17 // expected-error{{value of type '(Proto1 & Proto2)?'}}
+  let t18 = b ? nil : p
+  let _: Double = t18 // expected-error{{value of type '(Proto1 & Proto2)?'}}
+  let t19 = b ? arr : nil
+  let _: Double = t19 // expected-error{{value of type '[Int]?'}}
+  let t20 = b ? nil : arr
+  let _: Double = t20 // expected-error{{value of type '[Int]?'}}
+  let t21 = b ? opt : nil
+  let _: Double = t21 // expected-error{{value of type 'Int?'}}
+  let t22 = b ? nil : opt
+  let _: Double = t22 // expected-error{{value of type 'Int?'}}
+  let t23 = b ? iou : nil
+  let _: Double = t23 // expected-error{{value of type 'Int?'}}
+  let t24 = b ? nil : iou
+  let _: Double = t24 // expected-error{{value of type 'Int?'}}
+  let t25 = b ? n : nil
+  let _: Double = t25 // expected-error{{value of type 'Nilable'}}
+  let t26 = b ? nil : n
+  let _: Double = t26 // expected-error{{value of type 'Nilable'}}
 }
 
 // inference with IUOs
@@ -160,7 +217,7 @@ struct SR_3248 {
 
 SR_3248().callback?("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
 SR_3248().callback!("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
-SR_3248().callback("test")  // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
+SR_3248().callback("test")  // expected-error {{cannot invoke 'callback' with an argument list of type '(String)'}}
 
 _? = nil  // expected-error {{'nil' requires a contextual type}}
 _?? = nil // expected-error {{'nil' requires a contextual type}}
@@ -195,4 +252,43 @@ class C2 {
     var computed: P1? {
         return p1 ?? p2?.prop
     }
+}
+
+
+// rdar://problem/31779785
+class X { }
+
+class Bar {
+  let xOpt: X?
+  let b: Bool
+
+  init() {
+    let result = b ? nil : xOpt
+    let _: Int = result // expected-error{{cannot convert value of type 'X?' to specified type 'Int'}}
+  }
+}
+
+// rdar://problem/37508855
+func rdar37508855(_ e1: X?, _ e2: X?) -> [X] {
+  return [e1, e2].filter { $0 == nil }.map { $0! }
+}
+
+func se0213() {
+  struct Q: ExpressibleByStringLiteral {
+    typealias StringLiteralType =  String
+
+    var foo: String
+
+    init?(_ possibleQ: StringLiteralType) {
+      return nil
+    }
+
+    init(stringLiteral str: StringLiteralType) {
+      self.foo = str
+    }
+  }
+
+  _ = Q("why")?.foo // Ok
+  _ = Q("who")!.foo // Ok
+  _ = Q?("how") // Ok
 }

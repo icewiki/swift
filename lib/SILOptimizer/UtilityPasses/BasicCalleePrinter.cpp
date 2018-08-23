@@ -35,7 +35,7 @@ class BasicCalleePrinterPass : public SILModuleTransform {
 
   void printCallees(FullApplySite FAS) {
     llvm::outs() << "Function call site:\n";
-    if (auto *Callee = dyn_cast<SILInstruction>(FAS.getCallee()))
+    if (auto *Callee = FAS.getCallee()->getDefiningInstruction())
       llvm::outs() << *Callee;
     llvm::outs() << *FAS.getInstruction();
 
@@ -60,7 +60,6 @@ class BasicCalleePrinterPass : public SILModuleTransform {
     }
   }
 
-  StringRef getName() override { return "Basic Callee Printer"; }
 };
 
 } // end anonymous namespace

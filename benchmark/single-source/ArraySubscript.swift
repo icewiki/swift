@@ -13,6 +13,11 @@
 // This test checks the performance of modifying an array element.
 import TestsUtils
 
+public let ArraySubscript = BenchmarkInfo(
+  name: "ArraySubscript",
+  runFunction: run_ArraySubscript,
+  tags: [.validation, .api, .Array])
+
 @inline(never)
 public func run_ArraySubscript(_ N: Int) {
   SRand()
@@ -25,7 +30,7 @@ public func run_ArraySubscript(_ N: Int) {
   var arrays = [[Int]](repeating: [], count: numArrays)
   for i in 0..<numArrays {
     for _ in 0..<numArrayElements {
-      arrays[i].append(Int(truncatingBitPattern: Random()))
+      arrays[i].append(Int(truncatingIfNeeded: Random()))
     }
   }
 
@@ -34,6 +39,5 @@ public func run_ArraySubscript(_ N: Int) {
     arrays[i][bound(i)] =
       max(arrays[i-1][bound(i-1)], arrays[i][bound(i)])
   }
-  CheckResults(arrays[0][0] <= arrays[numArrays-1][bound(numArrays-1)],
-               "Incorrect results in QuickSort.")
+  CheckResults(arrays[0][0] <= arrays[numArrays-1][bound(numArrays-1)])
 }

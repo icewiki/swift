@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 infix operator ====
 infix operator <<<<
@@ -71,20 +71,20 @@ func g_recover_missing_tuple_paren(_ b: Int) {
 
 //===--- Parse errors.
 
-func parseError1a(_ a: ) {} // expected-error {{expected parameter type following ':'}}
+func parseError1a(_ a: ) {} // expected-error {{expected parameter type following ':'}} {{23-23= <#type#>}}
 
-func parseError1b(_ a: // expected-error {{expected parameter type following ':'}}
+func parseError1b(_ a: // expected-error {{expected parameter type following ':'}} {{23-23= <#type#>}}
                   ) {}
 
-func parseError2(_ a: Int, b: ) {} // expected-error {{expected parameter type following ':'}}
+func parseError2(_ a: Int, b: ) {} // expected-error {{expected parameter type following ':'}} {{30-30= <#type#>}}
 
-func parseError3(_ a: unknown_type, b: ) {} // expected-error {{use of undeclared type 'unknown_type'}}  expected-error {{expected parameter type following ':'}}
+func parseError3(_ a: unknown_type, b: ) {} // expected-error {{use of undeclared type 'unknown_type'}}  expected-error {{expected parameter type following ':'}} {{39-39= <#type#>}}
 
 func parseError4(_ a: , b: ) {} // expected-error 2{{expected parameter type following ':'}}
 
 func parseError5(_ a: b: ) {} // expected-error {{use of undeclared type 'b'}}  expected-error {{expected ',' separator}} {{24-24=,}} expected-error {{expected parameter name followed by ':'}}
 
-func parseError6(_ a: unknown_type, b: ) {} // expected-error {{use of undeclared type 'unknown_type'}}  expected-error {{expected parameter type following ':'}}
+func parseError6(_ a: unknown_type, b: ) {} // expected-error {{use of undeclared type 'unknown_type'}}  expected-error {{expected parameter type following ':'}} {{39-39= <#type#>}}
 
 func parseError7(_ a: Int, goo b: unknown_type) {} // expected-error {{use of undeclared type 'unknown_type'}}
 
@@ -123,7 +123,7 @@ func testObjCMethodCurry(_ a : ClassWithObjCMethod) -> (Int) -> () {
 }
 
 // We used to crash on this.
-func rdar16786220(inout let c: Int) -> () { // expected-error {{parameter may not have multiple 'inout', 'var', or 'let' specifiers}} {{25-29=}}
+func rdar16786220(inout let c: Int) -> () { // expected-error {{parameter must not have multiple '__owned', 'inout', '__shared', 'var', or 'let' specifiers}} {{25-29=}}
 // expected-error @-1 {{'inout' before a parameter name is not allowed, place it before the parameter type instead}}{{19-24=}}{{32-32=inout }}
 
   c = 42
@@ -139,7 +139,7 @@ _ = [1] !!! [1]   // unambiguously picking the array overload.
 
 
 // <rdar://problem/16786168> Functions currently permit 'var inout' parameters
-func var_inout_error(inout var x : Int) {} // expected-error {{parameter may not have multiple 'inout', 'var', or 'let' specifiers}} {{28-32=}}
+func var_inout_error(inout var x : Int) {} // expected-error {{parameter must not have multiple '__owned', 'inout', '__shared', 'var', or 'let' specifiers}} {{28-32=}}
 // expected-error @-1 {{'inout' before a parameter name is not allowed, place it before the parameter type instead}} {{22-27=}}{{36-36=inout }}
 
 // Unnamed parameters require the name "_":
@@ -168,3 +168,14 @@ func testCurryFixits() {
 // Bogus diagnostic talking about a 'var' where there is none
 func invalidInOutParam(x: inout XYZ) {}
 // expected-error@-1{{use of undeclared type 'XYZ'}}
+
+// Parens around the 'inout'
+func parentheticalInout(_ x: ((inout Int))) {}
+
+var value = 0
+parentheticalInout(&value)
+
+func parentheticalInout2(_ fn: (((inout Int)), Int) -> ()) {
+  var value = 0
+  fn(&value, 0)
+}
